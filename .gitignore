@@ -1,0 +1,19 @@
+# Xcode / Swift
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
+.build/
+.swiftpm/
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# macOS
+.DS_Store
+
+# Secrets
+*.p8
+*.p12
+*.mobileprovision
+.env
