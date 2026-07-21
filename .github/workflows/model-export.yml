@@ -1,0 +1,54 @@
+# model-export — Reframe checkpoint → Core ML mlpackage（手動觸發）
+#
+# coremltools 不支援 Windows，整合者本機（Windows + RTX 5060）只能訓練不能轉檔，
+# 所以轉檔走這條 CI：
+#   1. 本機訓練完，把 Training/checkpoints/best.pt commit + push 進 repo
+#   2. GitHub → Actions → model-export → Run workflow
+#   3. 到該 run 的 Artifacts 下載 → 解壓後得到 ReframeModel.mlpackage.zip →
+#      再解壓得到完整的 ReframeModel.mlpackage/ 資料夾（之後放進 Assets/ 整合）
+name: model-export
+
+on:
+  workflow_dispatch:
+
+jobs:
+  export:
+    name: Export ReframeModel.mlpackage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies (CPU torch + coremltools)
+        run: |
+          python -m pip install --upgrade pip
+          # 若之後 coremltools 跟不上最新 torch（convert 階段報版本警告或
+          # unsupported op），把下面第一行改成 coremltools 官方支援矩陣內的
+          # 版本再跑，例如：
+          #   pip install "torch==2.6.0" "torchvision==0.21.0" --index-url https://download.pytorch.org/whl/cpu
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install coremltools
+
+      - name: Export Core ML model
+        run: python Training/export_coreml.py
+
+      # 直接 upload 目錄會把「內容物」放在 artifact 根層（下載解壓只剩散落的
+      # Manifest.json / Data/，少了 ReframeModel.mlpackage 這層資料夾）。
+      # mlpackage 必須是完整帶 .mlpackage 副檔名的資料夾才有效，所以先 zip
+      # 保住外層資料夾再上傳；下載後解兩層 zip 得到完整 ReframeModel.mlpackage/。
+      - name: Zip mlpackage (preserve wrapping folder)
+        run: |
+          cd Training/checkpoints
+          zip -r ReframeModel.mlpackage.zip ReframeModel.mlpackage
+
+      - name: Upload mlpackage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ReframeModel.mlpackage
+          path: Training/checkpoints/ReframeModel.mlpackage.zip
+          if-no-files-found: error

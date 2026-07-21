@@ -1,0 +1,36 @@
+name: AICam
+options:
+  bundleIdPrefix: com.arieswu
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+packages:
+  AICamCore:
+    path: Core
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    TARGETED_DEVICE_FAMILY: "1"
+    DEVELOPMENT_TEAM: ""
+targets:
+  AICam:
+    type: application
+    platform: iOS
+    sources:
+      - App/Sources
+    dependencies:
+      - package: AICamCore
+    scheme: {}
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: AICam
+        NSCameraUsageDescription: AICam 需要相機權限才能取景與拍攝。
+        NSPhotoLibraryAddUsageDescription: AICam 需要權限把拍好的照片存入你的相簿。
+        UILaunchScreen: {}
+        UIUserInterfaceStyle: Dark
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UIRequiresFullScreen: true
+        ITSAppUsesNonExemptEncryption: false

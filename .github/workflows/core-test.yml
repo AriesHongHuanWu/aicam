@@ -1,0 +1,18 @@
+name: core-test
+on:
+  push:
+    paths:
+      - "Core/**"
+      - ".github/workflows/core-test.yml"
+  workflow_dispatch:
+concurrency:
+  group: core-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container: swift:5.10-jammy
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run AICamCore tests
+        run: swift test --package-path Core

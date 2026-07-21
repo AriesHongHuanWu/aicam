@@ -17,3 +17,8 @@ DerivedData/
 *.p12
 *.mobileprovision
 .env
+
+# Training data (local only; checkpoints ARE committed)
+Training/data/
+__pycache__/
+*.pyc
