@@ -1,0 +1,13 @@
+{
+  "id": "honghuanwu/aicam-reframe-train",
+  "title": "AICam Reframe Train",
+  "code_file": "aicam_reframe_train.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_internet": "true",
+  "dataset_sources": [],
+  "competition_sources": [],
+  "kernel_sources": []
+}

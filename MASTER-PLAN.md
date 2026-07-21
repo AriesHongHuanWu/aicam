@@ -6,7 +6,9 @@
 **UI 方向**: 純黑白、有質感、功能齊全但介面不複雜（§9）。
 **目標**: 未來可上架 App Store（§13）。
 
-> **狀態（2026-07-21）**: 規劃完成，程式碼 0 行。本文件由 Fable 制定，之後由 Opus session 依 §10 路線圖從 P0 開始逐階段執行。執行者動工前必須讀完本檔。
+> **狀態（2026-07-21 更新）**: **P0 骨架完成** — 38 檔案（相機層/黑白 UI 殼/L1 構圖引擎+測試/Gemini 導演/訓練管線），CI 全綠（ubuntu 測試 + macOS unsigned IPA artifact），**全部待真機驗證**。
+> 已執行的計劃調整（用戶決定）：L3 導演層先用 Gemini 雲端直連（key 貼在 app 設定頁 → Keychain；上架前才換 proxy）；L2 Reframe 模型訓練提前開跑，在 Kaggle GPU 執行（`Training/kaggle/`，帳號 honghuanwu），不在本機（本機 torch 已移除）。
+> 下一步：真機驗證 P0 → P1 專業控制。
 
 ---
 
