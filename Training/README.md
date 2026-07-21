@@ -8,11 +8,18 @@ GitHub Actions（Windows 裝不了 coremltools，見下方〈CoreML 匯出〉）
 
 Weakly-supervised（免人工標註）：
 
-- **正例** = 專業照片的原始取景（短邊 resize 後 center crop）
-- **負例** = 同一張圖內的隨機視窗（邊長 0.68–0.95×短邊、隨機位置、±5° 旋轉）
-  —— 模擬「取景取歪了」
+- **正例** = 專業照片的**完整原始取景**（全帧視窗，不做 center crop —— v2 的
+  center crop 會砍掉橫幅左右 1/3，構圖訊號根本進不了正例）
+- **負例** = 同一張圖內的**同長寬比**隨機視窗（scale U(0.55, 0.90)、位置均勻、
+  **無旋轉**）—— 模擬「取景取偏了／太緊」；歪斜由 App 層 CoreMotion 規則負責
+- 兩支走**完全相同**的 crop → squash resize（PIL BILINEAR）路徑：同插值、同
+  重採樣次數。「正例縮得多（~2.9x）、負例縮得少（1.6~2.6x）」的縮放幅度差
+  已做過對抗性審查：PIL resize 有抗鋸齒（輸出座標下濾波器固定），實測
+  content-controlled AUC ≈ 0.5，判定不構成作弊通道 —— 但**不可**換成
+  torch/cv2 的 naive bilinear，也**不可**換高解析資料源（細節與載重不變量
+  見 `dataset.py` docstring）
 - **免費監督訊號** = 擾動量本身：負例視窗中心相對圖中心的偏移
-  `(dx, dy)` 與 `dzoom = log(min(w,h)/視窗邊長)`
+  `(dx, dy)`（相對 w、h 的比例）與 `dzoom = log(1/scale)` ∈ (0.105, 0.598)
 
 模型 `ReframeNet` = MobileNetV3-Small（ImageNet 預訓練）+ 共享 trunk + 兩顆頭：
 

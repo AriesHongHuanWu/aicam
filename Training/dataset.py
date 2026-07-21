@@ -1,23 +1,49 @@
 # -*- coding: utf-8 -*-
-"""dataset.py — Reframe 弱監督配對資料集（MASTER-PLAN §4.3）。
+"""dataset.py — Reframe 弱監督配對資料集 v3（MASTER-PLAN §4.3）。
 
-每張專業照片產生一對樣本：
-  正例 pos = 原始取景（短邊 resize 到 size 後 center crop size×size）
-  負例 neg = 原圖內隨機視窗（模擬「取景取歪了」）：
-             邊長 = min(w,h) × U(0.68, 0.95)，先裁「帶旋轉餘裕的大窗」→
-             PIL rotate U(-5°, 5°) → 取內接 side×side 視窗（全為真實像素、
-             無 expand=False 補黑角），最後 resize 到 size×size
-  delta   = 負例視窗相對原圖的取景差量（免費監督訊號）：
-             dx = (視窗中心x − 圖中心x) / w      ∈ 約 [-0.3, 0.3]
-             dy = (視窗中心y − 圖中心y) / h      ∈ 約 [-0.3, 0.3]
-             dzoom = log(min(w,h) / 視窗邊長)    ∈ 約 [0.05, 0.39]
+v2 訓練實測 val pairwise acc ≈ 0.53（丟銅板）— 驗屍結論（Kaggle run v2）：
+  (a) 正負例處理管線不對稱（正例 1 次 resize；負例裁切+旋轉+縮放 2 次重採樣）
+      → 模型學「處理痕跡」不學構圖，train loss 0.004 / val 53%。
+  (b) 正例做 center square crop：3:2 橫幅被砍掉左右 1/3，「專業取景」訊號
+      根本沒進正例；scale 0.95 的負例窗與正例幾乎相同卻標反 → 標籤噪音。
 
-回傳 (pos_tensor, neg_tensor, delta_tensor)；影像皆為 ImageNet mean/std 正規化的
-float32 (3, size, size)。壞圖（截斷/太小/非影像）以 try/except 換下一張索引。
+v3 構造原則：**兩支样本唯一的差異只能是「取景幾何」本身**：
+  正例 pos = 全帧視窗（scale=1、置中）
+  負例 neg = 同長寬比隨機視窗：scale U(0.55, 0.90)、位置均勻、無旋轉
+  兩者走完全相同的路徑：crop(視窗) → resize((size,size)) squash（同插值、
+  同重採樣次數）。squash 造成的變形兩者一致（同 aspect），不構成可作弊差異。
+  旋轉整個移除：水平歪斜由 App 層 CoreMotion 規則負責，模型不需要，而旋轉
+  插值是 v2 的作弊通道之一。
 
-隨機性：全部走可設 seed 的 numpy Generator，種子 = (seed, epoch, index)，
-與 DataLoader worker 數量無關、跨執行可重現。train.py 每個 epoch 呼叫
-set_epoch(epoch) 讓訓練視窗每輪不同；驗證/評測固定 epoch=0。
+  ★ 縮放幅度差審查（v3 對抗性審查結論，動這段管線前必讀）：
+  疑點：pos 恆縮 ~2.9x（640→224）、neg 只縮 1.6~2.6x，縮放比分佈零重疊 ——
+  若銳利度/噪點/JPEG 痕跡隨縮放比變化，標籤直接洩漏（且 dzoom=log(1/scale)
+  恰為縮放比之差，delta 頭也能純靠低階痕跡回歸）。
+  實證（真實照片 × imgix 模擬管線、內容受控反事實實驗）：判定為**理論性
+  通道，實務不成立**——PIL 的 Image.resize 是 antialiased（kernel 支撐隨縮放
+  比伸縮 = 輸出座標下濾波器固定），場景內容 MTF 與縮放比無關；實測
+  HF/噪點底/方塊梳三特徵的 content-controlled AUC = 0.51/0.55/0.51（≈丟銅板）。
+  曾試過「pos 先縮到 (ww,wh) 對齊解析度」補丁：pos 多一層複合濾波反而
+  變系統性偏軟（HF AUC 0.505→0.557、均值 −10%）→ 製造新通道，已撤回。
+  載重不變量（破壞任一條，上述結論作廢）：
+  (1) 兩支都必須走 PIL Image.resize + BILINEAR。換 torch/cv2 的 naive
+      bilinear（固定 2x2 kernel、無抗鋸齒）對稱性立刻崩潰 —— 白噪音實驗
+      HF 比值恰 = scale，可直接讀出標籤。
+  (2) 資料源必須維持低解析縮圖（640px q80；活的感光噪點/JPEG 格已被
+      Lanczos 9x 縮小殺掉）。換高解析原檔會讓釘在原圖像素格上的痕跡復活
+      成「縮放比讀數」，任何重採樣幾何都救不了，只能靠對稱隨機退化
+      （blur/re-JPEG 兩支同分佈）壓制。
+  (3) 驗收時 val acc > 0.95 應優先懷疑低階通道復活，而非慶祝。
+
+  delta = 負例視窗相對理想取景（=全帧）的誤差向量（免費監督）：
+      dx = (視窗中心x − 圖中心x) / w        ∈ (-0.225, 0.225)
+      dy = (視窗中心y − 圖中心y) / h        ∈ (-0.225, 0.225)
+      dzoom = log(1/scale)                  ∈ (0.105, 0.598)
+  修正指令 = −delta（README「Swift 介面」節同語意；模型不產生「上前」訊號）。
+
+回傳 (pos_tensor, neg_tensor, delta_tensor)；ImageNet 正規化 float32 (3,size,size)。
+壞圖 try/except 換下一張。隨機性：numpy Generator 種子 = (seed, epoch, index)，
+與 worker 數無關可重現；train.py 每輪 set_epoch()，驗證/評測固定 epoch=0。
 """
 
 from __future__ import annotations
@@ -34,6 +60,8 @@ IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 IMAGE_EXTS = (".jpg", ".jpeg", ".png")
 MIN_SIDE = 64  # 短邊小於此值視為壞圖
+NEG_SCALE_LO = 0.55
+NEG_SCALE_HI = 0.90  # 上限 0.90：0.9x 以上的視窗與全帧太像，會變標籤噪音
 
 
 def _to_tensor(img: Image.Image) -> torch.Tensor:
@@ -41,6 +69,15 @@ def _to_tensor(img: Image.Image) -> torch.Tensor:
     arr = np.asarray(img, dtype=np.float32) / 255.0
     arr = (arr - IMAGENET_MEAN) / IMAGENET_STD
     return torch.from_numpy(np.ascontiguousarray(arr.transpose(2, 0, 1)))
+
+
+def _window_to_tensor(img: Image.Image, box: tuple[int, int, int, int], size: int) -> torch.Tensor:
+    """視窗 → squash resize → tensor。正負例都必須走這一條路徑（對稱性鐵律）：
+    任何只套在其中一支的處理（旋轉/濾波/二次縮放）都是模型的作弊通道。
+    這裡的 PIL BILINEAR 是載重不變量：PIL resize 有抗鋸齒（輸出座標下濾波器
+    固定），縮放幅度差才不會洩漏標籤 —— 詳見模組 docstring 的審查結論；
+    絕不可換成 torch/cv2 的 naive bilinear。"""
+    return _to_tensor(img.crop(box).resize((size, size), Image.BILINEAR))
 
 
 class ReframePairDataset(Dataset):
@@ -91,38 +128,21 @@ class ReframePairDataset(Dataset):
 
         rng = self._rng(i)
 
-        # ---- 正例：短邊 resize 到 size，再 center crop size×size ----
-        scale = size / min(w, h)
-        rw = max(size, int(round(w * scale)))
-        rh = max(size, int(round(h * scale)))
-        resized = img.resize((rw, rh), Image.BILINEAR)
-        left = (rw - size) // 2
-        top = (rh - size) // 2
-        pos_img = resized.crop((left, top, left + size, top + size))
+        # ---- 正例：全帧視窗（scale=1）----
+        pos = _window_to_tensor(img, (0, 0, w, h), size)
 
-        # ---- 負例：隨機視窗 + 小角度旋轉 ----
-        # 先取「帶旋轉餘裕的大窗」→ 旋轉 → 再取內接的 side×side 視窗，
-        # 保證視窗內全是真實像素。若先裁再轉（expand=False），角落會補黑 —
-        # 模型只要偵測黑角就能分辨正負例，pairwise accuracy 閘門會被假象灌水。
-        angle = float(rng.uniform(-5.0, 5.0))
-        rad = math.radians(abs(angle))
-        margin = math.cos(rad) + math.sin(rad)  # 內接視窗所需外框倍率（≤ ~1.084）
-        side = int(round(min(w, h) * float(rng.uniform(0.68, 0.95))))
-        side = max(1, min(side, int(min(w, h) / margin)))
-        big = min(min(w, h), max(side, int(math.ceil(side * margin))))
-        x0 = int(rng.integers(0, w - big + 1))
-        y0 = int(rng.integers(0, h - big + 1))
-        big_img = img.crop((x0, y0, x0 + big, y0 + big))
-        big_img = big_img.rotate(angle, resample=Image.BILINEAR, expand=False)
-        off = (big - side) // 2
-        neg_img = big_img.crop((off, off, off + side, off + side))
-        neg_img = neg_img.resize((size, size), Image.BILINEAR)
+        # ---- 負例：同長寬比隨機視窗（唯一差異 = 取景幾何）----
+        scale = float(rng.uniform(NEG_SCALE_LO, NEG_SCALE_HI))
+        ww = max(1, int(round(w * scale)))
+        wh = max(1, int(round(h * scale)))
+        x0 = int(rng.integers(0, w - ww + 1))
+        y0 = int(rng.integers(0, h - wh + 1))
+        neg = _window_to_tensor(img, (x0, y0, x0 + ww, y0 + wh), size)
 
-        # ---- delta 標籤（負例視窗的取景差量）----
-        # 旋轉以大窗中心為圓心，內接視窗中心 = 大窗中心。
-        dx = ((x0 + big / 2.0) - w / 2.0) / w
-        dy = ((y0 + big / 2.0) - h / 2.0) / h
-        dzoom = math.log(min(w, h) / side)
+        # ---- delta：負例視窗相對全帧的誤差向量 ----
+        dx = ((x0 + ww / 2.0) - w / 2.0) / w
+        dy = ((y0 + wh / 2.0) - h / 2.0) / h
+        dzoom = math.log(1.0 / scale)
         delta = torch.tensor([dx, dy, dzoom], dtype=torch.float32)
 
-        return _to_tensor(pos_img), _to_tensor(neg_img), delta
+        return pos, neg, delta
