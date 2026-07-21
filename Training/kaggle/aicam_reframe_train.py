@@ -15,6 +15,24 @@ def run(cmd):
     subprocess.run(cmd, check=True)
 
 
+def gpu_preflight():
+    """先跑一個真的 CUDA 卷積再開工 — P100(sm_60) 與新版 torch wheel 不相容，
+    metadata 已指定 NvidiaTeslaT4；萬一還是分到不相容 GPU，這裡秒退而不是
+    下載 8000 張圖之後才在 train 裡炸。"""
+    import torch
+    if not torch.cuda.is_available():
+        raise SystemExit("PREFLIGHT FAIL: no CUDA device")
+    name = torch.cuda.get_device_name(0)
+    try:
+        x = torch.randn(1, 3, 32, 32, device="cuda")
+        w = torch.randn(8, 3, 3, 3, device="cuda")
+        torch.nn.functional.conv2d(x, w).sum().item()
+    except Exception as e:
+        raise SystemExit(f"PREFLIGHT FAIL: GPU {name} incompatible with this torch build: {e}")
+    print(f"PREFLIGHT OK: {name}", flush=True)
+
+
+gpu_preflight()
 os.chdir("/kaggle/working")
 if os.path.exists("aicam"):
     shutil.rmtree("aicam")
