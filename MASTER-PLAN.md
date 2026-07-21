@@ -67,6 +67,8 @@
 | F31 | Reframe 構圖模型（學攝影師取景） | 自訓小 CNN 回歸最佳取景差量 `(Δx,Δy,Δzoom)`→走位指令；weakly-supervised 專業照訓練，CoreML int8 ANE <8ms（§4.3） | 5–10fps | 5 | P5 |
 | F32 | 構圖模式識別（對稱/引導線…閘控規則） | 5 類分類頭（與 F31 共享 backbone）→ 對稱場景不硬推三分線（§4.3c） | 2s | 3 | P5 |
 | F33 | 個人化品味（越拍越懂她） | 篩選 keep/reject＋「她滿意」標記 → 端上 logistic 重加權分數成分，per-profile（§4.5） | 拍後 | 3 | P5 |
+| F34 | **目標點導引（Doka 式對點）** | TargetSolver（Core，可測）：主體錨點＋最佳構圖目標環疊在取景器，把點對進環＝最佳構圖；PointSmoother 平滑追蹤、GuidanceTracker 遲滯鎖定（對齊→haptic＋「完美，拍！」＋可選自動抓拍）；AspectFillMapper 處理 aspect-fill 座標映射 | 10fps | 4 | P2 |
+| F35 | 導演即時模式 | 教練模式下每 10s 取景快照＋結構化現場 context（主體位置/分數/目前建議）→ Gemini 給現場導演建議；與拍後建議共用節流 | 10s | 2 | P2（雲端版） |
 
 ---
 
@@ -248,7 +250,7 @@ Design tokens（`App/Sources/DesignSystem/Tokens.swift`）：
 F7、F18–F22、F27。**驗收**：全手動可用；DNG 能在 Lightroom 打開且與 HEIF 配對；斑馬/峰值/直方圖即時；音量鍵快門。
 
 ### P2 教練核心（本產品靈魂）
-F1–F9、F23–F25、F30 + §3 管線 + §4 引擎（含 unit tests）+ §5 3D 指導。**驗收**：真機教練模式穩 30fps、分數環與建議合理、抓拍能抓到睜眼笑容、熱降級生效、AI 代調有 toast 可還原。
+F1–F9、F23–F25、F30、**F34 目標點導引（主打 UX）**、F35 導演即時模式 + §3 管線 + §4 引擎（含 unit tests）+ §5 3D 指導。**驗收**：真機教練模式穩 30fps、分數環與建議合理、抓拍能抓到睜眼笑容、熱降級生效、AI 代調有 toast 可還原。
 
 ### P3 AI 調色
 F11–F14 + `MetalPreviewView` 替換。**驗收**：LUT 預覽 60fps 不掉帧；推薦符合場景；AutoEnhance 膚色不跑掉；RAW 顯影預設可用。

@@ -121,6 +121,21 @@ final class CameraController {
         }
     }
 
+    // MARK: - 教練分析 tap（A5：CoachSession 掛載一次）
+
+    /// 把教練層的 AVCaptureVideoDataOutput 接進 session（sessionQueue 上執行）；
+    /// 之後前後鏡重配時會自動對新 connection 重設 rotation / mirroring。
+    func attachVideoTap(_ tap: VideoFrameTap) {
+        service.attachVideoTap(tap)
+    }
+
+    /// 開/關教練 tap connection 的出帧（sessionQueue 上執行）。
+    /// 離開教練模式停帧（不拆 output）：拍照/專業模式不付 30fps 資料流與功耗成本；
+    /// 前後鏡重配後的新 connection 也會沿用此狀態。
+    func setVideoTapEnabled(_ enabled: Bool) {
+        service.setVideoTapEnabled(enabled)
+    }
+
     // MARK: - 私有
 
     private func applyLensOptions(_ options: [LensOption]) {
@@ -144,6 +159,12 @@ final class CaptureSessionService: @unchecked Sendable {
     /// 以下狀態僅限 sessionQueue 存取。
     private var videoInput: AVCaptureDeviceInput?
     private var inflightDelegates: [Int64: PhotoCaptureDelegate] = [:]
+    /// 教練層 video tap（A5）；attach 後常駐。
+    private var videoTap: VideoFrameTap?
+    /// tap connection 是否出帧（CoachSession.setActive 驅動；重配後套用到新 connection）。
+    /// 預設 false：attach 恆發生在教練首次啟用時，緊接的 setVideoTapEnabled(true)
+    /// 在同一 serial queue 上排在 attach 之後，順序保證先關後開。
+    private var videoTapEnabled = false
 
     // MARK: 對外（任意 actor）
 
@@ -222,7 +243,51 @@ final class CaptureSessionService: @unchecked Sendable {
         }
     }
 
+    /// 教練層 video tap 掛載（A5）：加 output 並設 connection 的 rotation / mirroring。
+    /// 可在 session 尚未配置時呼叫（connection 尚不存在則只記住 tap，configureLocked 時補設）。
+    func attachVideoTap(_ tap: VideoFrameTap) {
+        sessionQueue.async {
+            guard self.videoTap !== tap else { return }
+            self.videoTap = tap
+            self.session.beginConfiguration()
+            if !self.session.outputs.contains(tap.output), self.session.canAddOutput(tap.output) {
+                self.session.addOutput(tap.output)
+            }
+            self.configureVideoTapConnectionLocked(
+                front: self.videoInput?.device.position == .front
+            )
+            self.session.commitConfiguration()
+        }
+    }
+
+    /// 教練 tap connection 出帧開關（A5：CoachSession.setActive 驅動）。
+    func setVideoTapEnabled(_ enabled: Bool) {
+        sessionQueue.async {
+            self.videoTapEnabled = enabled
+            self.videoTap?.output.connection(with: .video)?.isEnabled = enabled
+        }
+    }
+
     // MARK: sessionQueue only
+
+    /// 對 video tap 的 connection 設直向 90° 與前鏡 mirroring（僅 sessionQueue）。
+    /// automaticallyAdjustsVideoMirroring 必須先關才准手動設 isVideoMirrored（順序不可倒）。
+    /// 前鏡設 isVideoMirrored=true → buffer 與 preview 視覺一致，Vision 結果不需再翻 x。
+    private func configureVideoTapConnectionLocked(front: Bool) {
+        guard let tap = videoTap else { return }
+        tap.setFrontCamera(front)
+        guard let connection = tap.output.connection(with: .video) else { return }
+        if connection.isVideoRotationAngleSupported(90) {
+            connection.videoRotationAngle = 90
+        }
+        if connection.isVideoMirroringSupported {
+            connection.automaticallyAdjustsVideoMirroring = false
+            connection.isVideoMirrored = front
+        }
+        // 重配後的新 connection 預設出帧：沿用教練模式的開關狀態
+        // （例：拍照模式下切前後鏡，tap 應維持停帧）。
+        connection.isEnabled = videoTapEnabled
+    }
 
     /// 重配 input（先移除舊的）＋確保 photoOutput 已加入。成功回傳焦段表。
     private func configureLocked(front: Bool) -> [LensOption]? {
@@ -274,6 +339,10 @@ final class CaptureSessionService: @unchecked Sendable {
         for connection in session.connections where connection.isVideoRotationAngleSupported(90) {
             connection.videoRotationAngle = 90
         }
+
+        // 教練 video tap 的 connection 在 input 重配後是新物件：
+        // 重設 rotation / 前鏡 mirroring（A5；flipCamera 走這條路徑）
+        configureVideoTapConnectionLocked(front: front)
 
         session.commitConfiguration()
         return options

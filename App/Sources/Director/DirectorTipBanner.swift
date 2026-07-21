@@ -2,6 +2,7 @@
 //  AICam — 導演建議膠囊（跨模組契約，A4 擁有）。
 //
 //  自己讀 DirectorCenter.shared；無 tip 時不佔空間。
+//  來源標籤：live tip 標「AI 導演・現場」、拍後 tip 標「AI 導演」。
 //  黑 80% 膠囊 + 0.5pt 白 20% 邊框，§9 黑白 tokens、動效 ≤200ms。
 
 import SwiftUI
@@ -15,7 +16,7 @@ struct DirectorTipBanner: View {
         Group {
             if let tip = DirectorCenter.shared.latestTip {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text("AI 導演")
+                    Text(tip.source == .live ? "AI 導演・現場" : "AI 導演")
                         .font(.caption2.weight(.semibold))
                         .foregroundStyle(Self.gray2)
                     Text(tip.text)

@@ -17,7 +17,9 @@ struct DSPressScaleButtonStyle: ButtonStyle {
 // MARK: - 快門
 
 /// 72pt 白色雙圈快門。
-/// P0 外圈為素圈；`score` 參數保留給後續階段的構圖分數環（P0 不繪製）。
+/// `score` 非 nil（教練模式）時外圈變成 0–100 構圖分數進度環：
+/// 背景白 20% 素圈 + 白色 trim 進度（12 點鐘起順時針），分數變化 0.2s 動畫。
+/// `score == nil` 時與 P0 行為完全相同（白色素圈）。
 struct ShutterButton: View {
     let score: Int?
     let action: () -> Void
@@ -33,9 +35,21 @@ struct ShutterButton: View {
             action()
         } label: {
             ZStack {
-                Circle()
-                    .stroke(Tokens.fg, lineWidth: 3)
-                    .frame(width: 72, height: 72)
+                if let score {
+                    Circle()
+                        .stroke(Tokens.fg.opacity(0.2), lineWidth: 3)
+                        .frame(width: 72, height: 72)
+                    Circle()
+                        .trim(from: 0, to: CGFloat(min(max(score, 0), 100)) / 100)
+                        .stroke(Tokens.fg, style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                        .rotationEffect(.degrees(-90))
+                        .frame(width: 72, height: 72)
+                        .animation(.linear(duration: 0.2), value: score)
+                } else {
+                    Circle()
+                        .stroke(Tokens.fg, lineWidth: 3)
+                        .frame(width: 72, height: 72)
+                }
                 Circle()
                     .fill(Tokens.fg)
                     .frame(width: 58, height: 58)

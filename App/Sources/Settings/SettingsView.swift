@@ -2,6 +2,7 @@
 //  AICam — 設定頁（跨模組契約，A4 擁有；RootView 以 sheet 呈現）。
 //
 //  區塊：AI 導演（開關 / Gemini API Key / 模型 / 測試連線）、
+//        教練（自動抓拍 / 導演即時建議，P2）、
 //        拍攝（網格線 P0 佔位）、關於（版本）。
 //  API Key 只存本機 Keychain（"gemini-api-key"），不進 UserDefaults；
 //  全部繁體中文、§9 黑白 tokens（無彩色 accent）。
@@ -17,6 +18,8 @@ struct SettingsView: View {
 
     @AppStorage("director.enabled") private var directorEnabled = false
     @AppStorage("director.model") private var directorModel = "gemini-2.5-flash"
+    @AppStorage("director.live") private var directorLive = false
+    @AppStorage("coach.autoCapture") private var coachAutoCapture = false
     @AppStorage("grid.enabled") private var gridEnabled = false
 
     // MARK: - 畫面狀態
@@ -42,6 +45,7 @@ struct SettingsView: View {
         NavigationStack {
             Form {
                 directorSection
+                coachSection
                 captureSection
                 aboutSection
             }
@@ -132,6 +136,36 @@ struct SettingsView: View {
             Text("拍照後由 Gemini 給一句下一步建議；API Key 只儲存在本機 Keychain。")
                 .font(Tokens.label(12))
                 .foregroundStyle(Tokens.gray2)
+        }
+        .listRowBackground(Self.rowBackground)
+        .listRowSeparatorTint(Tokens.hairlineColor)
+    }
+
+    // MARK: - 教練
+
+    private var coachSection: some View {
+        Section {
+            Toggle(isOn: $coachAutoCapture) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("自動抓拍")
+                    Text("對齊鎖定且表情到位時自動拍攝")
+                        .font(Tokens.label(12))
+                        .foregroundStyle(Tokens.gray2)
+                }
+            }
+            .tint(Tokens.gray2)
+
+            Toggle(isOn: $directorLive) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("導演即時建議")
+                    Text("教練模式下每 10 秒給一句現場建議（需 API Key）")
+                        .font(Tokens.label(12))
+                        .foregroundStyle(Tokens.gray2)
+                }
+            }
+            .tint(Tokens.gray2)
+        } header: {
+            sectionHeader("教練")
         }
         .listRowBackground(Self.rowBackground)
         .listRowSeparatorTint(Tokens.hairlineColor)

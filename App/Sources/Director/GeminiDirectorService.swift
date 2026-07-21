@@ -36,7 +36,7 @@ enum DirectorServiceError: LocalizedError {
     }
 }
 
-/// Gemini 導演服務：送一張剛拍好的 JPEG，換一句下一步建議。
+/// Gemini 導演服務：送一張 JPEG（取景器即時畫面或剛拍好的成品），換一句下一步建議。
 /// 無狀態、執行緒安全（只持有不可變的 URLSession 與 Logger）。
 final class GeminiDirectorService: @unchecked Sendable {
 
@@ -48,8 +48,23 @@ final class GeminiDirectorService: @unchecked Sendable {
     private static let modelDefaultsKey = "director.model"
     private static let minConfidence = 0.4
 
-    private static let promptText =
-        "你是頂尖人像攝影導演。看這張剛拍的照片，回一個 JSON 物件 {\"tip\": string, \"confidence\": number}：tip 是給攝影者的下一步具體建議，繁體中文、最多 14 字、立即可執行（走位/角度/光線/姿勢）；confidence 0到1。畫面裡有人就以拍好人為最優先。"
+    /// 共通導演指令（live / 拍後皆用）。
+    private static let systemPrompt = """
+    你是世界頂尖的人像攝影導演與構圖教練。規則：
+    1. 只回一個 JSON 物件 {"tip": string, "confidence": number}，不要任何其他文字。
+    2. tip 用繁體中文、最多 14 字、動作立即可執行，具體到方位或身體指令，例如「往左兩步拍側光」「請她下巴微收」「蹲低從腰部高度拍」。
+    3. 若「現場資訊」裡已有「目前建議」，不要重複同一件事，改給下一個最有價值的改進。
+    4. 構圖已經很好時，先稱讚，再給一個進階變化（換角度、換焦段或換姿勢）。
+    5. confidence 為 0 到 1；畫面裡有人就以拍好人為最優先。
+    """
+
+    /// live 模式補充句：這是取景器即時畫面。
+    private static let livePromptLine =
+        "這是目前取景器的即時畫面，給攝影者現在就能執行的下一步。"
+
+    /// 拍後補充句：先肯定再給下一張的改進。
+    private static let postCapturePromptLine =
+        "這是剛拍下的成品，先一句肯定再給下一張的改進。"
 
     /// URL 中 key / model 的保守允許字元（RFC 3986 unreserved）。
     private static let unreservedCharacters =
@@ -67,9 +82,10 @@ final class GeminiDirectorService: @unchecked Sendable {
 
     // MARK: - Public
 
-    /// 對一張剛拍的 JPEG 要一句導演建議。
+    /// 對一張 JPEG 要一句導演建議（live = 取景器即時畫面；postCapture = 剛拍下的成品）。
+    /// context = 現場結構化資訊（主體位置/構圖分數/光位/目前規則建議），組進「現場資訊：」段。
     /// 任何錯誤（無 key、網路、解析、低置信度）一律回 nil，只記 debug log — 不打擾拍攝。
-    func tip(jpeg: Data, hint: String?) async -> DirectorTip? {
+    func tip(jpeg: Data, context: String?, source: DirectorTip.Source = .postCapture) async -> DirectorTip? {
         guard !jpeg.isEmpty else { return nil }
         guard let key = storedAPIKey() else {
             logger.debug("tip skipped: missing API key")
@@ -81,9 +97,15 @@ final class GeminiDirectorService: @unchecked Sendable {
             return nil
         }
 
-        var prompt = Self.promptText
-        if let hint, !hint.isEmpty {
-            prompt += "\n補充情境：\(hint)"
+        var prompt = Self.systemPrompt
+        switch source {
+        case .live:
+            prompt += "\n\(Self.livePromptLine)"
+        case .postCapture:
+            prompt += "\n\(Self.postCapturePromptLine)"
+        }
+        if let context, !context.isEmpty {
+            prompt += "\n現場資訊：\(context)"
         }
 
         // gemini-2.5 flash 系列預設會先產生 thinking tokens，且 maxOutputTokens
@@ -149,7 +171,7 @@ final class GeminiDirectorService: @unchecked Sendable {
                 logger.debug("tip dropped: confidence \(confidence, privacy: .public)")
                 return nil
             }
-            return DirectorTip(text: text, confidence: confidence, date: Date())
+            return DirectorTip(text: text, confidence: confidence, date: Date(), source: source)
         } catch {
             logger.debug("tip failed: \(String(describing: error), privacy: .public)")
             return nil
