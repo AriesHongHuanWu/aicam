@@ -39,12 +39,12 @@ if os.path.exists("aicam"):
 run(["git", "clone", "--depth", "1", "https://github.com/AriesHongHuanWu/aicam.git"])
 os.chdir("aicam")
 
-run([sys.executable, "Training/fetch_unsplash_lite.py", "--max", "8000"])
+run([sys.executable, "Training/fetch_unsplash_lite.py", "--max", "24000"])
 run([
     sys.executable, "Training/train.py",
     "--data", "Training/data/images",
     "--out", "/kaggle/working/checkpoints",
-    "--epochs", "10",
+    "--epochs", "14",
     "--batch", "96",
     "--workers", "4",
 ])

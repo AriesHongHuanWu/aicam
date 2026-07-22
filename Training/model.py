@@ -30,6 +30,7 @@ class ReframeNet(nn.Module):
         self.trunk = nn.Sequential(
             nn.Linear(FEATURE_DIM, 256),
             nn.ReLU(inplace=True),
+            nn.Dropout(0.2),  # v4：抗過擬合（v3 train loss 0.004 / val 0.63）
         )
         self.head_score = nn.Linear(256, 1)
         self.head_delta = nn.Linear(256, 3)

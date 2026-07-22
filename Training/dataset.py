@@ -35,15 +35,27 @@ v3 構造原則：**兩支样本唯一的差異只能是「取景幾何」本身
       （blur/re-JPEG 兩支同分佈）壓制。
   (3) 驗收時 val acc > 0.95 應優先懷疑低階通道復活，而非慶祝。
 
-  delta = 負例視窗相對理想取景（=全帧）的誤差向量（免費監督）：
-      dx = (視窗中心x − 圖中心x) / w        ∈ (-0.225, 0.225)
-      dy = (視窗中心y − 圖中心y) / h        ∈ (-0.225, 0.225)
-      dzoom = log(1/scale)                  ∈ (0.105, 0.598)
+  ★ v4 追加（動機：v3 實測 val 0.63 但 train loss 0.004 = 逐張過擬合）：
+  (1) augment 旗標（預設 False）：train.py 只在訓練 epoch 打開。開啟時 ——
+      pos 改為「近全帧微抖動視窗」scale U(0.95, 1.0)、位置在餘裕內均勻
+      （仍是好取景，但逐 epoch 像素不同 → 消除 v3 的恆定記憶錨點）；
+      光度增強（亮度/對比/飽和、偶爾灰階、偶爾輕模糊）與水平翻轉。
+  (2) 增強對稱鐵律：所有光度/翻轉操作「同一組參數、同時套在 pos 與 neg」
+      且一律在 resize 之後的輸出空間執行 —— 任何只套一支或參數不同的增強，
+      都會變成新的作弊通道（同 v3 審查結論）。翻轉時兩支 delta 的 dx 同步取負。
+  (3) augment=False（驗證/評測）：pos = 全帧、無任何增強，且 neg 的 RNG
+      消耗順序與 v3 完全一致 → val 數字可與 v3 基線直接比較。
+
+  delta（v4 起 pos/neg 各一）= 該視窗相對理想取景（=全帧）的誤差向量：
+      dx = (視窗中心x − 圖中心x) / w        neg ∈ (-0.225, 0.225)；pos 微小
+      dy = (視窗中心y − 圖中心y) / h        同上
+      dzoom = log(1/scale)                  neg ∈ (0.105, 0.598)；pos ∈ [0, 0.051)
   修正指令 = −delta（README「Swift 介面」節同語意；模型不產生「上前」訊號）。
 
-回傳 (pos_tensor, neg_tensor, delta_tensor)；ImageNet 正規化 float32 (3,size,size)。
-壞圖 try/except 換下一張。隨機性：numpy Generator 種子 = (seed, epoch, index)，
-與 worker 數無關可重現；train.py 每輪 set_epoch()，驗證/評測固定 epoch=0。
+回傳 (pos_tensor, neg_tensor, delta_pos, delta_neg)；影像為 ImageNet 正規化
+float32 (3,size,size)。壞圖 try/except 換下一張。隨機性：numpy Generator 種子
+= (seed, epoch, index)，與 worker 數無關可重現；train.py 每輪 set_epoch()，
+驗證/評測固定 epoch=0。
 """
 
 from __future__ import annotations
@@ -53,7 +65,7 @@ import os
 
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
 from torch.utils.data import Dataset
 
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
@@ -62,6 +74,9 @@ IMAGE_EXTS = (".jpg", ".jpeg", ".png")
 MIN_SIDE = 64  # 短邊小於此值視為壞圖
 NEG_SCALE_LO = 0.55
 NEG_SCALE_HI = 0.90  # 上限 0.90：0.9x 以上的視窗與全帧太像，會變標籤噪音
+POS_SCALE_LO = 0.95  # v4：訓練時 pos 為近全帧微抖動視窗（仍與 neg 上限 0.90 有間隙）
+AUG_GRAY_P = 0.10
+AUG_BLUR_P = 0.15
 
 
 def _to_tensor(img: Image.Image) -> torch.Tensor:
@@ -71,13 +86,27 @@ def _to_tensor(img: Image.Image) -> torch.Tensor:
     return torch.from_numpy(np.ascontiguousarray(arr.transpose(2, 0, 1)))
 
 
-def _window_to_tensor(img: Image.Image, box: tuple[int, int, int, int], size: int) -> torch.Tensor:
-    """視窗 → squash resize → tensor。正負例都必須走這一條路徑（對稱性鐵律）：
+def _window(img: Image.Image, box: tuple[int, int, int, int], size: int) -> Image.Image:
+    """視窗 → squash resize（PIL）。正負例都必須走這一條路徑（對稱性鐵律）：
     任何只套在其中一支的處理（旋轉/濾波/二次縮放）都是模型的作弊通道。
     這裡的 PIL BILINEAR 是載重不變量：PIL resize 有抗鋸齒（輸出座標下濾波器
     固定），縮放幅度差才不會洩漏標籤 —— 詳見模組 docstring 的審查結論；
     絕不可換成 torch/cv2 的 naive bilinear。"""
-    return _to_tensor(img.crop(box).resize((size, size), Image.BILINEAR))
+    return img.crop(box).resize((size, size), Image.BILINEAR)
+
+
+def _apply_photometric(img: Image.Image, params: tuple[float, float, float, bool, float]) -> Image.Image:
+    """光度增強（v4）。呼叫端保證：同一組 params 套 pos 與 neg 兩支、且在
+    resize 之後的輸出空間執行（輸出尺寸相同 → 操作效果對稱，無縮放耦合）。"""
+    brightness, contrast, saturation, gray, blur_radius = params
+    img = ImageEnhance.Brightness(img).enhance(brightness)
+    img = ImageEnhance.Contrast(img).enhance(contrast)
+    img = ImageEnhance.Color(img).enhance(saturation)
+    if gray:
+        img = img.convert("L").convert("RGB")
+    if blur_radius > 0:
+        img = img.filter(ImageFilter.GaussianBlur(blur_radius))
+    return img
 
 
 class ReframePairDataset(Dataset):
@@ -86,6 +115,10 @@ class ReframePairDataset(Dataset):
         self.size = int(size)
         self.seed = seed
         self.epoch = 0
+        # v4：訓練增強旗標。預設 False（驗證/評測走乾淨路徑），train.py 於
+        # 訓練 epoch 設 True、驗證前設回 False（DataLoader 每輪重建 iterator，
+        # worker 會拿到當下的 dataset 狀態）。
+        self.augment = False
         if not os.path.isdir(img_dir):
             raise FileNotFoundError(f"找不到圖片目錄：{img_dir}")
         self.files = sorted(
@@ -128,21 +161,57 @@ class ReframePairDataset(Dataset):
 
         rng = self._rng(i)
 
-        # ---- 正例：全帧視窗（scale=1）----
-        pos = _window_to_tensor(img, (0, 0, w, h), size)
-
         # ---- 負例：同長寬比隨機視窗（唯一差異 = 取景幾何）----
-        scale = float(rng.uniform(NEG_SCALE_LO, NEG_SCALE_HI))
-        ww = max(1, int(round(w * scale)))
-        wh = max(1, int(round(h * scale)))
-        x0 = int(rng.integers(0, w - ww + 1))
-        y0 = int(rng.integers(0, h - wh + 1))
-        neg = _window_to_tensor(img, (x0, y0, x0 + ww, y0 + wh), size)
+        # RNG 消耗順序鐵律：neg 的三個 draw 永遠最先，之後才是 v4 的 pos 抖動
+        # 與增強 draw —— 這讓 augment=False 時 neg 視窗與 v3 基線完全相同。
+        n_scale = float(rng.uniform(NEG_SCALE_LO, NEG_SCALE_HI))
+        nw = max(1, int(round(w * n_scale)))
+        nh = max(1, int(round(h * n_scale)))
+        nx0 = int(rng.integers(0, w - nw + 1))
+        ny0 = int(rng.integers(0, h - nh + 1))
 
-        # ---- delta：負例視窗相對全帧的誤差向量 ----
-        dx = ((x0 + ww / 2.0) - w / 2.0) / w
-        dy = ((y0 + wh / 2.0) - h / 2.0) / h
-        dzoom = math.log(1.0 / scale)
-        delta = torch.tensor([dx, dy, dzoom], dtype=torch.float32)
+        # ---- 正例：全帧（乾淨路徑）或近全帧微抖動視窗（v4 訓練路徑）----
+        if self.augment:
+            p_scale = float(rng.uniform(POS_SCALE_LO, 1.0))
+            pw = max(1, int(round(w * p_scale)))
+            ph = max(1, int(round(h * p_scale)))
+            px0 = int(rng.integers(0, w - pw + 1))
+            py0 = int(rng.integers(0, h - ph + 1))
+        else:
+            p_scale, pw, ph, px0, py0 = 1.0, w, h, 0, 0
 
-        return pos, neg, delta
+        pos_img = _window(img, (px0, py0, px0 + pw, py0 + ph), size)
+        neg_img = _window(img, (nx0, ny0, nx0 + nw, ny0 + nh), size)
+
+        # ---- delta：各視窗相對全帧的誤差向量 ----
+        def _delta(x0: int, y0: int, ww: int, wh: int, scale: float) -> list[float]:
+            return [((x0 + ww / 2.0) - w / 2.0) / w,
+                    ((y0 + wh / 2.0) - h / 2.0) / h,
+                    math.log(1.0 / scale)]
+
+        d_pos = _delta(px0, py0, pw, ph, p_scale)
+        d_neg = _delta(nx0, ny0, nw, nh, n_scale)
+
+        # ---- v4 對稱增強：同一組參數、兩支同套、resize 後執行 ----
+        if self.augment:
+            params = (
+                float(rng.uniform(0.75, 1.25)),                                  # 亮度
+                float(rng.uniform(0.80, 1.20)),                                  # 對比
+                float(rng.uniform(0.70, 1.30)),                                  # 飽和
+                bool(rng.random() < AUG_GRAY_P),                                 # 灰階
+                float(rng.uniform(0.3, 1.0)) if rng.random() < AUG_BLUR_P else 0.0,  # 模糊
+            )
+            pos_img = _apply_photometric(pos_img, params)
+            neg_img = _apply_photometric(neg_img, params)
+            if rng.random() < 0.5:  # 水平翻轉：兩支同翻、dx 同步取負
+                pos_img = pos_img.transpose(Image.FLIP_LEFT_RIGHT)
+                neg_img = neg_img.transpose(Image.FLIP_LEFT_RIGHT)
+                d_pos[0] = -d_pos[0]
+                d_neg[0] = -d_neg[0]
+
+        return (
+            _to_tensor(pos_img),
+            _to_tensor(neg_img),
+            torch.tensor(d_pos, dtype=torch.float32),
+            torch.tensor(d_neg, dtype=torch.float32),
+        )

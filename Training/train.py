@@ -6,12 +6,17 @@
     python Training/train.py --data Training/data/images
     python Training/train.py --data Training/data/images --epochs 2 --batch 32   # smoke
 
-損失 = MarginRankingLoss(margin=0.5)(score_pos, score_neg, target=1)
-     + 0.5 × SmoothL1(delta_neg_pred, delta_gt)
-     + 0.1 × SmoothL1(delta_pos_pred, 0)
+損失（v4 — 動機：v3 margin loss 第 4 輪就飽和到 0.004、val 卡 0.63 過擬合）：
+  rank  = softplus(-(s_pos - s_neg)).mean()      # BPR 型，永不完全飽和
+  delta = 1.0 × SmoothL1(d_neg/D, gt_neg/D) + 0.3 × SmoothL1(d_pos/D, gt_pos/D)
+          D = (0.225, 0.225, 0.598) 各維上限正規化（v3 審查建議：未正規化時
+          delta 項只占總損失 ~2%，delta 頭學不動）
+其他 v4 反過擬合手段：dataset.augment（對稱增強+pos 微抖動，只在訓練 epoch
+開）、AdamW weight_decay 0.01、backbone 學習率 = 0.1×（heads 全速）、
+model.py trunk 加 Dropout(0.2)。每 epoch 另印 train pairwise acc 監控泛化差距。
 
 輸出：--out 目錄下 best.pt（val pairwise accuracy 最高，含 model state_dict +
-val_acc + args）與 last.pt。每個 epoch 印 train loss 與 val pairwise accuracy。
+val_acc + args）與 last.pt。
 """
 
 from __future__ import annotations
@@ -74,7 +79,7 @@ def evaluate_pairwise(model: nn.Module, loader: DataLoader, device: torch.device
     model.eval()
     correct = 0
     total = 0
-    for pos, neg, _delta in loader:
+    for pos, neg, *_ in loader:
         pos = pos.to(device, non_blocking=True)
         neg = neg.to(device, non_blocking=True)
         s_pos, _ = model(pos)
@@ -108,10 +113,20 @@ def main() -> None:
     )
 
     model = ReframeNet(pretrained=True).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    # v4：backbone 低速微調、heads 全速；weight_decay 拉到 0.01 抗過擬合。
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": model.features.parameters(), "lr": args.lr * 0.1},
+            {"params": list(model.trunk.parameters())
+                       + list(model.head_score.parameters())
+                       + list(model.head_delta.parameters()), "lr": args.lr},
+        ],
+        weight_decay=0.01,
+    )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    rank_loss = nn.MarginRankingLoss(margin=0.5)
     smooth_l1 = nn.SmoothL1Loss()
+    # v4：delta 各維以標籤上限正規化（docstring 損失定義）。
+    delta_norm = torch.tensor([0.225, 0.225, 0.598], device=device)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     def amp_ctx():
@@ -132,38 +147,44 @@ def main() -> None:
     last_path = os.path.join(args.out, "last.pt")
 
     for epoch in range(1, args.epochs + 1):
-        # 訓練視窗每輪換一批（epoch 混入 RNG 種子）；驗證固定 epoch=0 可重現。
+        # 訓練視窗每輪換一批（epoch 混入 RNG 種子）；驗證固定 epoch=0 + 關增強。
         dataset.set_epoch(epoch)
+        dataset.augment = True
         model.train()
         t0 = time.time()
         loss_sum = 0.0
         n_seen = 0
-        for pos, neg, delta_gt in train_loader:
+        n_rank_ok = 0
+        for pos, neg, dpos_gt, dneg_gt in train_loader:
             pos = pos.to(device, non_blocking=True)
             neg = neg.to(device, non_blocking=True)
-            delta_gt = delta_gt.to(device, non_blocking=True)
+            dpos_gt = dpos_gt.to(device, non_blocking=True)
+            dneg_gt = dneg_gt.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
             with amp_ctx():
                 s_pos, d_pos = model(pos)
                 s_neg, d_neg = model(neg)
-                target = torch.ones_like(s_pos)
                 loss = (
-                    rank_loss(s_pos, s_neg, target)
-                    + 0.5 * smooth_l1(d_neg, delta_gt)
-                    + 0.1 * smooth_l1(d_pos, torch.zeros_like(d_pos))
+                    torch.nn.functional.softplus(-(s_pos - s_neg)).mean()
+                    + 1.0 * smooth_l1(d_neg / delta_norm, dneg_gt / delta_norm)
+                    + 0.3 * smooth_l1(d_pos / delta_norm, dpos_gt / delta_norm)
                 )
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
             loss_sum += loss.item() * pos.size(0)
+            n_rank_ok += (s_pos > s_neg).sum().item()
             n_seen += pos.size(0)
         scheduler.step()
         train_loss = loss_sum / max(1, n_seen)
+        train_acc = n_rank_ok / max(1, n_seen)
 
         dataset.set_epoch(0)
+        dataset.augment = False
         val_acc = evaluate_pairwise(model, val_loader, device)
         print(f"epoch {epoch}/{args.epochs}  train_loss={train_loss:.4f}  "
-              f"val_pairwise_acc={val_acc:.4f}  ({time.time() - t0:.0f}s)")
+              f"train_acc={train_acc:.4f}  val_pairwise_acc={val_acc:.4f}  "
+              f"({time.time() - t0:.0f}s)")
 
         save_ckpt(last_path, epoch, val_acc)
         if val_acc > best_acc:
