@@ -8,7 +8,9 @@
 
 > **狀態（2026-07-21 更新）**: **P0 骨架完成** — 38 檔案（相機層/黑白 UI 殼/L1 構圖引擎+測試/Gemini 導演/訓練管線），CI 全綠（ubuntu 測試 + macOS unsigned IPA artifact），**全部待真機驗證**。
 > 已執行的計劃調整（用戶決定）：L3 導演層先用 Gemini 雲端直連（key 貼在 app 設定頁 → Keychain；上架前才換 proxy）；L2 Reframe 模型訓練提前開跑，在 Kaggle GPU 執行（`Training/kaggle/`，帳號 honghuanwu），不在本機（本機 torch 已移除）。
-> 下一步：真機驗證 P0 → P1 專業控制。
+> **P2 教練核心已完成**（目標點導引 F34＋導演即時模式 F35，CI 綠 commit 7454907，待真機驗證）。
+> **Reframe 模型 v5 GATE PASS：val pairwise acc = 0.8650（門檻 0.85）** — 凍結 backbone＋跨圖配對封死按圖記憶路徑後達標；checkpoint 在 `Training/checkpoints/best.pt`，訓練迭代史與載重不變量見 `Training/dataset.py` docstring。§4.8 第 2 關（真機 50 張盲測）與第 3 關（blend ablation）仍待做。
+> 下一步：真機驗證 P0/P2 → P1 專業控制；模型整合（分數 blend + delta 導引）屬 P5。
 
 ---
 
