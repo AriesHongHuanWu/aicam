@@ -10,7 +10,8 @@
 > 已執行的計劃調整（用戶決定）：L3 導演層先用 Gemini 雲端直連（key 貼在 app 設定頁 → Keychain；上架前才換 proxy）；L2 Reframe 模型訓練提前開跑，在 Kaggle GPU 執行（`Training/kaggle/`，帳號 honghuanwu），不在本機（本機 torch 已移除）。
 > **P2 教練核心已完成**（目標點導引 F34＋導演即時模式 F35，CI 綠 commit 7454907，待真機驗證）。
 > **Reframe 模型 v5 GATE PASS：val pairwise acc = 0.8650（門檻 0.85）** — 凍結 backbone＋跨圖配對封死按圖記憶路徑後達標；checkpoint 在 `Training/checkpoints/best.pt`，訓練迭代史與載重不變量見 `Training/dataset.py` docstring。§4.8 第 2 關（真機 50 張盲測）與第 3 關（blend ablation）仍待做。
-> 下一步：真機驗證 P0/P2 → P1 專業控制；模型整合（分數 blend + delta 導引）屬 P5。
+> **v0.3.0「AI 全面接管」已出貨（release v0.3.0，CI 綠）**：Reframe 模型上機（ANE ~5fps，分數 0.6 規則+0.4 模型混合、dzoom 退後建議）、AI 代操曝光（逆光保臉 EV/高光保護/臉部測光＋toast 還原）、12 款 Look 調色引擎＋Metal 即時濾鏡預覽（Layer fallback）＋場景推薦/全自動、水平儀+過曝 HUD。等效完成：F23 v1、F11/F12 v1、F31 整合、F6/F7 即時面。
+> 下一步：真機驗證 v0.3.0（Metal 方向/色溫方向/前鏡測光點三個一行修正項）→ P1 專業控制（RAW/手動）→ §4.8 第 2 關真機 50 張盲測。
 
 ---
 
