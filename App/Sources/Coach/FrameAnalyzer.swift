@@ -11,6 +11,9 @@
 //    （不留舊關節誤判切邊）。
 //  - saliency（無臉時的主體 fallback）：只在「無臉持續 > 1s」後才啟動，
 //    之後每 ~1s 一次，結果 2.5s 內有效 — 有人臉的正常拍攝路徑完全不付 saliency 成本。
+//  - 場景分類 VNClassifyImageRequest（v0.3.0 F12 調色推薦）：每 ~1s 一次，
+//    confidence > 0.3 前 5 個 identifier；兩次之間沿用快取（場景變化慢，
+//    ≤1s 陳舊可接受）；perform 失敗清空（誠實：拿不到就空陣列）。
 //  - VNDetectFaceCaptureQualityRequest：本檔「沒有」執行（FaceFact.captureQuality
 //    恆為 nil，屬 P4 篩選範疇），即時管線不付這筆成本。
 //
@@ -39,6 +42,8 @@ final class FrameAnalyzer {
     private let faceLandmarksRequest = VNDetectFaceLandmarksRequest()
     private let bodyPoseRequest = VNDetectHumanBodyPoseRequest()
     private let saliencyRequest = VNGenerateAttentionBasedSaliencyImageRequest()
+    /// 場景分類（F12 調色推薦）：每 ~1s 才 perform 一次（見檔頭節奏）。
+    private let classifyRequest = VNClassifyImageRequest()
 
     // MARK: - analysisQueue 專屬狀態
 
@@ -50,6 +55,9 @@ final class FrameAnalyzer {
     /// 「無臉」狀態的起始時間（media timestamp）；有臉即清空。
     /// saliency 只在無臉持續 > 1s 後才跑（見檔頭節奏注釋）。
     private var noFaceSince: Double?
+    /// 場景分類節奏與快取（每 ~1s 一次；兩次之間沿用上次結果）。
+    private var lastClassifyAt: Double = -.greatestFiniteMagnitude
+    private var lastSceneTags: [String] = []
     /// 上一帧的前後鏡標記：變化 = 座標空間鏡像跳變 → 就地清跨帧快取
     /// （與 scheduleReset 雙保險，不依賴通知時序）。
     private var lastIsFront: Bool?
@@ -239,6 +247,26 @@ final class FrameAnalyzer {
             } catch {}
         }
 
+        // 場景分類（F12 調色推薦）：每 ~1s 一次（教練管線既有節奏內，不另開 timer）。
+        // confidence > 0.3、confidence 高→低排序取前 5 個 identifier。
+        // perform 失敗 = 本帧無分類觀測 → 清空快取（誠實原則；不讀重用 request
+        // 的過期 results，同檔頭 Vision 失敗處理鐵律）。兩次分類之間沿用上次
+        // 結果（場景變化慢，≤1s 陳舊可接受；切鏡/重置由 clearFrameCaches 清）。
+        if timestamp - lastClassifyAt >= 1.0 {
+            lastClassifyAt = timestamp
+            do {
+                try handler.perform([classifyRequest])
+                lastSceneTags = (classifyRequest.results ?? [])
+                    .compactMap { $0 as? VNClassificationObservation }
+                    .filter { $0.confidence > 0.3 }
+                    .sorted { $0.confidence > $1.confidence }
+                    .prefix(5)
+                    .map { $0.identifier }
+            } catch {
+                lastSceneTags = []
+            }
+        }
+
         let subjectBox = makeSubjectBox(faces: faces, joints: joints, timestamp: timestamp)
         let histogram = makeHistogram(pixelBuffer: pixelBuffer)
         let (rollDeg, pitchDeg) = motionAngles(gravity: gravity, isFront: isFront)
@@ -251,7 +279,7 @@ final class FrameAnalyzer {
             cameraPitchDeg: pitchDeg,
             subjectDistanceM: nil,          // P2 尚無深度來源，誠實回 nil
             histogram: histogram,
-            sceneTags: [],                  // 場景分類屬 Tier C（P3 起）
+            sceneTags: lastSceneTags,       // VNClassifyImageRequest（每 ~1s 更新）
             isFrontCamera: isFront,
             timestamp: timestamp
         )
@@ -266,6 +294,8 @@ final class FrameAnalyzer {
         lastSaliencyRunAt = -.greatestFiniteMagnitude
         lastSaliencyHitAt = -.greatestFiniteMagnitude
         noFaceSince = nil
+        lastClassifyAt = -.greatestFiniteMagnitude
+        lastSceneTags = []
     }
 
     // MARK: - 臉

@@ -26,11 +26,30 @@
 //    （camera.onCameraReconfigured）→ planner/One-Euro/tracker/stabilizer 全重置。
 //  - snapshotJPEG(maxDimension:)：最新分析帧同步轉 JPEG（Gemini 導演即時模式取帧用）。
 //
+//  v0.3.0 Reframe 模型整合（A1；MASTER-PLAN §4.3b / §4.6）：
+//  - CoachPipeline 內 lazy 建 ReframeScorer（首個模型 tick 於 analysisQueue 觸發；
+//    init 失敗 = 無模型，全程規則路徑，不 crash 不重試）。
+//  - 節奏：每 3 次分析 tick 跑一次（~5fps）；取 %3==2 與 FrameAnalyzer 的
+//    body pose tick（%3==1，兩計數器同事件重置、近似同步）錯開，不疊峰。
+//    AppStorage "coach.model.enabled"（預設 true）關閉或熱降級 ≥ .serious 時停跑。
+//  - 取帧：VideoFrameTap.latestAnalysisBuffer() 直取當帧 buffer 餵
+//    ReframeScorer.score(_:)（onFacts 同 queue 同步呼叫，latestPixelBuffer
+//    恰為本帧；v0.3.0 修正輪已捨棄 snapshotJPEG(448) 的 JPEG 繞路）。
+//  - 分數混合（§4.6）：模型分未過期（≤1s）→ 0.6×規則分 + 0.4×score01×100，
+//    混合「先於」ScoreSmoother EMA（分數環不跳；§4.6 的 EMA 是獨立穩定層）；
+//    否則純規則分。發布 modelActive 供 UI 顯示「AI 構圖模型」啟用狀態。
+//  - 模型建議（保守）：dzoom > 0.25 且本帧規則候選為 nil 且未鎖定 →
+//    「退後兩步」（.distance, priority 20）進 stabilizer。修正 = −delta，
+//    dzoom>0 = 退後；dzoom 訓練標籤恆 ≥0，負/小值不可解讀成上前。
+//    dx/dy 本輪不驅動 UI（黏性目標語意不可破壞），只記 os_log（category "reframe"）。
+//
 //  待真機驗證（發布頻率 ~15fps；facts 屬性只有教練 overlay 應讀取，見檔尾註記）。
 
+import CoreVideo
 import Foundation
 import Observation
 import UIKit
+import os
 import AICamCore
 
 @MainActor
@@ -64,11 +83,18 @@ final class CoachSession {
     /// 最近 10 次分析間隔倒數的平均。
     private(set) var analysisFPS: Double = 0
     private(set) var thermalReduced: Bool = false
+    /// Reframe 構圖模型此刻是否參與評分（契約：UI 顯示「AI 構圖模型」啟用狀態）。
+    /// true = 模型已載入且最近一次模型分未過期（≤1s）正在混入 displayScore。
+    /// 只在值變化時寫入（@Observable 逐屬性追蹤）。
+    private(set) var modelActive: Bool = false
 
     // MARK: - 內部
 
     @ObservationIgnored private let camera: CameraController
-    @ObservationIgnored private let tap = VideoFrameTap()
+    /// v0.3.0 修正輪：tap 改由 CameraController 擁有（camera.videoTap）——
+    /// session 只能掛一顆 AVCaptureVideoDataOutput，教練分析與 MetalPreviewView
+    /// 的即時濾鏡預覽必須共用同一實例。
+    @ObservationIgnored private let tap: VideoFrameTap
     @ObservationIgnored private let pipeline = CoachPipeline()
     @ObservationIgnored private var isActive = false
     @ObservationIgnored private var hasAttachedTap = false
@@ -84,8 +110,18 @@ final class CoachSession {
 
     init(camera: CameraController) {
         self.camera = camera
+        self.tap = camera.videoTap
 
         let pipeline = self.pipeline
+        // Reframe 模型 tick 的取帧出口（啟用前設定一次；analysisQueue 上呼叫）。
+        // 必須 weak tap：tap → onFacts 閉包 → pipeline → provider → tap 會成環。
+        // onFacts 於 captureOutput 內同 queue 同步呼叫 → latestPixelBuffer 恰為本帧。
+        // v0.3.0 修正輪：直餵 buffer（scorer.score(_:)），不再繞 snapshotJPEG(448)
+        // 的 JPEG 編解碼（省 3–8ms/tick，且不引入與訓練分佈無關的壓縮噪聲）。
+        let tap = self.tap
+        pipeline.frameBufferProvider = { [weak tap] in
+            tap?.latestAnalysisBuffer()
+        }
         tap.onFacts = { [weak self] facts, bufferWidth, bufferHeight in
             // analysisQueue：pipeline 狀態只在此 queue 觸碰
             let output = pipeline.process(facts)
@@ -155,6 +191,7 @@ final class CoachSession {
             smoothedScore = 0
             displayScore = 0
             analysisFPS = 0
+            modelActive = false
             wasLocked = false
         }
     }
@@ -213,6 +250,10 @@ final class CoachSession {
         if score != displayScore {
             displayScore = score
         }
+        // 模型參與狀態（少變 → 只在值變化時寫入）
+        if output.modelActive != modelActive {
+            modelActive = output.modelActive
+        }
         // 實際 buffer 比例（僅接受直立帧：橫向 = 旋轉未生效，維持前值不畫錯）
         if bufferWidth > 0, bufferHeight >= bufferWidth {
             let aspect = Double(bufferWidth) / Double(bufferHeight)
@@ -230,6 +271,10 @@ final class CoachSession {
         wasLocked = locked
 
         maybeAutoCapture(output: output, locked: locked)
+
+        // AI 代操曝光（v0.3.0 契約：CoachSession 每次 publish 後呼叫；同在
+        // MainActor）。enabled 開關與 camera 接線檢查都在 evaluate 內部。
+        AIControlCenter.shared.evaluate(facts: output.facts)
     }
 
     private func maybeAutoCapture(output: CoachPipeline.Output, locked: Bool) {
@@ -268,6 +313,8 @@ private final class CoachPipeline {
         var advice: CoachAdvice?
         var smoothedScore: Double
         var analysisFPS: Double
+        /// Reframe 模型此帧是否參與評分混合（模型已載入且模型分未過期 ≤1s）。
+        var modelActive: Bool
         /// 本帧開始處理時的發布世代（scheduleReset 每次 +1）。
         /// CoachSession.publish 比對最新世代 — 重置「前」已在處理的舊座標帧
         /// 抵達 MainActor 時世代已過期 → 丟棄，杜絕清空後被舊帧蓋回 ~1 帧。
@@ -292,6 +339,27 @@ private final class CoachPipeline {
     private let tracker = GuidanceTracker()
     private var recentIntervals: [Double] = []
     private var lastTimestamp: Double?
+
+    // MARK: Reframe 模型（v0.3.0；analysisQueue 專屬）
+
+    /// 模型 tick 取帧來源（CoachSession 啟用前設定一次；analysisQueue 上呼叫）。
+    /// 回傳當帧 CVPixelBuffer（VideoFrameTap.latestAnalysisBuffer；onFacts 同
+    /// queue 同步呼叫 → 恰為本帧）。v0.3.0 修正輪：取代 JPEG 繞路直餵 scorer。
+    var frameBufferProvider: (() -> CVPixelBuffer?)?
+    /// dx/dy 本輪只記 log 不驅動 UI（黏性目標語意不可破壞）。
+    private static let reframeLog = Logger(subsystem: "com.arieswu.aicam", category: "reframe")
+    /// 分析 tick 計數（每次 process +1；resetState 歸零）。%3==2 跑模型 —
+    /// 與 FrameAnalyzer 的 body pose tick（%3==1，同事件重置、近似同步）錯開。
+    private var analysisTick = 0
+    /// lazy 載入：首個符合條件的模型 tick 才建 ReframeScorer（analysisQueue 上，
+    /// 首次可能含 mlpackage 現場編譯，期間遲到帧由 alwaysDiscardsLateVideoFrames 自然丟棄）。
+    /// init 失敗（無模型/載入失敗）只試一次 → 全程規則路徑，不重試不 crash。
+    private var scorerLoadAttempted = false
+    private var scorer: ReframeScorer?
+    /// 最近一次模型輸出（帶 media timestamp；>1s 過期不用）。
+    private var lastModelScore01: Double?
+    private var lastModelDelta: SIMD3<Double>?
+    private var lastModelAt: Double = -.greatestFiniteMagnitude
     /// 上一帧的前後鏡標記：切鏡瞬間 buffer 鏡像翻轉、座標跳變，
     /// 必須重置（否則 One-Euro 從舊位置滑過去、planner 保著錯誤承諾目標、
     /// tracker 可能短暫維持錯誤 locked）。與 CameraController.onCameraReconfigured
@@ -329,6 +397,12 @@ private final class CoachPipeline {
         }
         lastIsFront = facts.isFrontCamera
 
+        // Reframe 模型 tick（先於評分：本帧模型分立即可混入本帧顯示分）
+        analysisTick += 1
+        runModelTickIfDue(timestamp: facts.timestamp)
+        // 模型分未過期（≤1s）才參與混合／建議；過期靜默退回純規則
+        let modelFresh = lastModelScore01 != nil && facts.timestamp - lastModelAt <= 1.0
+
         let result = engine.evaluate(facts, config: config)
         var solved = TargetSolver.solve(facts: facts, result: result)
         // 錨點 One-Euro 平滑「先於」planner（A1 契約：StickyTargetPlanner.update 的
@@ -354,8 +428,27 @@ private final class CoachPipeline {
         if candidate?.category == .thirds, guidance.target != nil {
             candidate = nil
         }
+        // 模型建議（保守；MASTER-PLAN §4.3b）：修正 = −delta、dzoom>0 = 太緊 → 退後。
+        // 只在「規則層本帧無話可說、且尚未鎖定」時補位；dzoom 訓練標籤恆 ≥0，
+        // 負/小值不可解讀成上前 → 只有 > 0.25 的明確「太緊」訊號才發話。
+        // dx/dy 本輪不驅動 UI（目標環的黏性語意不可破壞），只在 tick 時記 log。
+        if candidate == nil,
+           modelFresh,
+           let delta = lastModelDelta, delta.z > 0.25,
+           guidance.lockState != .locked {
+            candidate = SuggestionCatalog.distanceTooClose.advice(priority: 20)
+        }
         let advice = stabilizer.update(candidate: candidate, at: facts.timestamp)
-        let smoothed = scoreSmoother.update(Double(result.score))
+        // 分數混合（§4.6）：0.6×規則 + 0.4×模型（0…100 域），混合先於 EMA
+        //（displayScore = EMA(混合分)：模型出現/過期時分數環漸變不跳）
+        let ruleScore = Double(result.score)
+        let blendedScore: Double
+        if modelFresh, let model01 = lastModelScore01 {
+            blendedScore = 0.6 * ruleScore + 0.4 * model01 * 100.0
+        } else {
+            blendedScore = ruleScore
+        }
+        let smoothed = scoreSmoother.update(blendedScore)
 
         if let last = lastTimestamp {
             let dt = facts.timestamp - last
@@ -378,7 +471,40 @@ private final class CoachPipeline {
             advice: advice,
             smoothedScore: smoothed,
             analysisFPS: fps,
+            modelActive: modelFresh,
             generation: currentGeneration
+        )
+    }
+
+    /// Reframe 模型 tick（analysisQueue）：開關/熱降級/節奏檢查 → lazy 載入 →
+    /// 取當帧 buffer → 推論 → 暫存（帶 timestamp）。任何一步失敗都靜默跳過本 tick。
+    private func runModelTickIfDue(timestamp: Double) {
+        // @AppStorage 在非 View 不可靠 → 直讀 UserDefaults；key 預設 true
+        //（object(forKey:) 為 nil = 用戶從未動過開關 = 開）
+        let enabled = (UserDefaults.standard.object(forKey: "coach.model.enabled") as? Bool) ?? true
+        guard enabled else { return }
+        // 熱降級 ≥ .serious 停跑模型（與 applyThermalPolicy 同判準；此處直讀
+        // thermalState，不依賴 MainActor 通知時序）
+        let thermal = ProcessInfo.processInfo.thermalState
+        guard thermal != .serious, thermal != .critical else { return }
+        // 每 3 次分析 tick 跑一次（~5fps）；%3==2 與 body pose tick 錯開（見屬性注釋)
+        guard analysisTick % 3 == 2 else { return }
+
+        if !scorerLoadAttempted {
+            scorerLoadAttempted = true
+            scorer = ReframeScorer()   // nil = 無模型 → 之後全程規則路徑
+        }
+        guard let scorer,
+              let buffer = frameBufferProvider?(),
+              let output = scorer.score(buffer)
+        else { return }
+
+        lastModelScore01 = output.score01
+        lastModelDelta = output.delta
+        lastModelAt = timestamp
+        // dx/dy 本輪只記 log（修正 = −delta；debug 級，正式版零成本）
+        Self.reframeLog.debug(
+            "score01=\(output.score01) dx=\(output.delta.x) dy=\(output.delta.y) dzoom=\(output.delta.z)"
         )
     }
 
@@ -391,6 +517,12 @@ private final class CoachPipeline {
         recentIntervals = []
         lastTimestamp = nil
         lastIsFront = nil
+        // 模型暫存清空（切鏡/翻鏡 = 取景空間跳變，舊 delta/分數不可跨用）；
+        // scorer 本身與座標空間無關 → 保留已載入的模型，不重載
+        analysisTick = 0
+        lastModelScore01 = nil
+        lastModelDelta = nil
+        lastModelAt = -.greatestFiniteMagnitude
     }
 }
 

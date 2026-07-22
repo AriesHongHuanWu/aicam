@@ -1,15 +1,28 @@
 //  RootView.swift
-//  AICam — 主畫面版面（A3：UI 殼）。
+//  AICam — 主畫面版面（A4：UI 整合擁有本檔）。
 //
 //  依賴其他模組（同一 module「AICam」，不需 import）：
 //  - CameraController / LensOption / PreviewSource / PreviewLayerView（A2，Capture）
 //  - CoachSession（A2，Coach）；CoachOverlayView（A3，Coach）
 //  - DirectorCenter / DirectorTipBanner / SettingsView（A4，Director）
+//  - MetalPreviewView（A3，Preview）；LookSuggester（A3，ColorLab）
+//  - AIControlToast / AIControlCenter（A2，AI 代操）
+//  - LookRecipe（AICamCore，A3 擁有定義）
 //
-//  本輪 UI 高級化：
-//  - 快門擊發全螢幕白閃（70ms opacity 疊層，haptic 由 ShutterButton 觸發不重複）。
-//  - 取景器頂/底黑漸層改細膩（0.35→0）。
-//  - 權限提示頁重排（icon + 標題 + 說明 + 按鈕，置中優雅）。
+//  v0.3.0「AI 全面接管」UI 整合：
+//  - 預覽切換：look.livePreview 且 Metal 未失敗 → MetalPreviewView（即時 Look）；
+//    否則 PreviewLayerView。Metal 失敗只影響本次（AppStorage 不動）。
+//  - Look 選擇列（拍照＋教練模式，鏡頭列上方）：原色＋12 款膠囊 chips、
+//    推薦前 3 名白點徽記；look.autoApply 開時每 5s 自動切 top-1
+//    （手動選過後 30s 內不搶）。
+//  - 教練 HUD：水平儀（|roll|<6° 顯示、<0.8° snap 白＋輕 haptic＋0.8s 後淡出）、
+//    過曝章（highlightClippedFraction > 0.10）、AIControlToast。
+//  - CoachSession facts → LookSuggester.ingest（每次 publish；hasFace 走同名參數）。
+//  - v0.3.0 修正輪：tap 由 CameraController 擁有（camera.videoTap）；Metal 取景器
+//    的帧流由 updatePreviewFrameFlow 依可見性開關（與教練需求在 camera 端仲裁）；
+//    AIControlCenter.shared.camera 於 .task 接線。
+//
+//  既有（v0.2.1，不可破壞）：快門白閃、細膩黑漸層、權限提示頁、教練接線、導演。
 
 import AICamCore
 import SwiftUI
@@ -23,9 +36,20 @@ struct RootView: View {
     @State private var coach: CoachSession?
     @AppStorage("mode") private var mode: CaptureMode = .photo
     @AppStorage("director.live") private var directorLive = false
+    /// Metal 即時濾鏡預覽開關（跨模組契約 key；預設 true）。
+    @AppStorage("look.livePreview") private var lookLivePreview = true
+    /// 目前選中 Look 的 id（跨模組契約 key；"none" = 原色）。
+    @AppStorage("look.selected") private var selectedLookID = "none"
+    /// AI 自動選 Look（跨模組契約 key；預設 false）。
+    @AppStorage("look.autoApply") private var lookAutoApply = false
     @State private var isSettingsPresented = false
     /// 快門擊發白閃疊層透明度。
     @State private var shutterFlashOpacity: Double = 0
+    /// Metal 預覽本次啟動失敗 → fallback 到 PreviewLayerView。
+    /// 只影響本次（look.livePreview 保持不動），重啟 app 會再試 Metal。
+    @State private var metalFailed = false
+    /// 用戶最近一次「手動」選 Look 的時刻；自動選 Look 30 秒內不搶。
+    @State private var lastManualLookAt = Date.distantPast
 
     var body: some View {
         ZStack {
@@ -35,7 +59,22 @@ struct RootView: View {
             // 供 CoachOverlayView 的 AspectFillMapper 映射用。
             GeometryReader { geo in
                 ZStack {
-                    PreviewLayerView(source: camera.previewSource)
+                    // 預覽切換：Metal 即時 Look 預覽（失敗即本次退回 Layer）。
+                    // 教練 overlay 疊在兩種 preview 上都要正常 → 同一 ZStack 內。
+                    if lookLivePreview && !metalFailed {
+                        MetalPreviewView(
+                            tap: camera.videoTap,
+                            recipeProvider: { Self.currentPreviewRecipe() },
+                            onFailure: {
+                                // 可能自渲染執行緒回呼 → hop 回 MainActor 再改 @State
+                                Task { @MainActor in
+                                    metalFailed = true
+                                }
+                            }
+                        )
+                    } else {
+                        PreviewLayerView(source: camera.previewSource)
+                    }
                     if mode == .coach, let coach {
                         CoachOverlayView(session: coach, containerSize: geo.size)
                     }
@@ -55,6 +94,14 @@ struct RootView: View {
             }
             .ignoresSafeArea()
             .allowsHitTesting(false)
+
+            // 教練 HUD（水平儀＋過曝章）＋ Look 推薦餵料。
+            // facts 只在教練模式發布 → 其他模式自動隱藏／不動作，不需 mode 判斷。
+            if let coach {
+                LookSuggestionFeeder(session: coach)
+                CoachHUD(session: coach)
+                    .allowsHitTesting(false)
+            }
 
             VStack(spacing: 0) {
                 StatusStrip { isSettingsPresented = true }
@@ -83,6 +130,11 @@ struct RootView: View {
                     .padding(.horizontal, 24)
                     .padding(.bottom, 4)
 
+                // AI 代操動作提示（疊在底部控制區上方；自身管理顯示/消失）。
+                AIControlToast()
+                    .padding(.horizontal, 24)
+                    .padding(.bottom, 4)
+
                 controls
             }
 
@@ -105,11 +157,28 @@ struct RootView: View {
                     DirectorCenter.shared.photoCaptured(jpeg: data)
                 }
             }
+            // 拍照處理背景 queue 呼叫：回目前選中 Look（原色 = nil 不套）。
+            camera.captureLookProvider = { Self.currentCaptureLook() }
+            // AI 代操曝光接線（A2 契約①）：CoachSession publish → evaluate 時
+            // camera 必須已接上，否則規則永不動作。
+            AIControlCenter.shared.camera = camera
             await camera.start()
+            // 冪等：非教練模式也掛 tap，供 Metal 即時濾鏡預覽取帧（A2 契約）；
+            // 並依 Metal 取景器可見性開出帧（教練模式外也要有帧流）。
+            camera.attachVideoTapIfNeeded()
+            updatePreviewFrameFlow()
             if coach == nil {
                 coach = CoachSession(camera: camera)
             }
             updateCoachWiring()
+        }
+        // AI 自動選 Look：每 5s 檢查一次 top-1（開關切換即重啟/取消 loop）。
+        .task(id: lookAutoApply) {
+            guard lookAutoApply else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(5))
+                autoApplyTopLook()
+            }
         }
         .onChange(of: mode) { _, _ in
             updateCoachWiring()
@@ -117,12 +186,41 @@ struct RootView: View {
         .onChange(of: directorLive) { _, _ in
             updateCoachWiring()
         }
+        .onChange(of: lookLivePreview) { _, _ in
+            // 設定頁切換即時預覽：補掛 tap（冪等）並重算出帧需求。
+            updatePreviewFrameFlow()
+        }
+        .onChange(of: metalFailed) { _, _ in
+            // Metal 失敗 fallback 到 PreviewLayerView：預覽端不再需要帧流
+            //（教練模式的需求由 CoachSession 自行表態，仲裁在 CameraController）。
+            updatePreviewFrameFlow()
+        }
+    }
+
+    /// Metal 即時濾鏡取景器的帧流開關（v0.3.0 修正輪）：
+    /// 取景器可見（look.livePreview 開且 Metal 未失敗）→ 確保 tap 已掛 + 開出帧；
+    /// 不可見 → 關「預覽端」出帧需求（教練模式的需求另行仲裁，不受影響）。
+    /// 呼叫時機：.task 啟動後、look.livePreview 變更、metalFailed 變更。
+    private func updatePreviewFrameFlow() {
+        let metalVisible = lookLivePreview && !metalFailed
+        if metalVisible {
+            camera.attachVideoTapIfNeeded()
+        }
+        camera.setPreviewFramesEnabled(metalVisible)
     }
 
     // MARK: - 底部控制區
 
     private var controls: some View {
         VStack(spacing: 16) {
+            // Look 選擇列：拍照＋教練模式，鏡頭列上方（v0.3.0）。
+            if mode == .photo || mode == .coach {
+                LookBar(selectedID: $selectedLookID) {
+                    lastManualLookAt = Date()
+                }
+                .transition(.opacity)
+            }
+
             LensBar(
                 options: camera.lensOptions,
                 selectedID: camera.currentLens?.id
@@ -158,6 +256,41 @@ struct RootView: View {
             )
             .ignoresSafeArea(edges: .bottom)
         )
+    }
+
+    // MARK: - Look（v0.3.0）
+
+    /// AppStorage "look.selected" 目前值（任意執行緒；UserDefaults 執行緒安全）。
+    /// Metal recipeProvider / captureLookProvider 都在背景 queue 呼叫 →
+    /// 不經 @AppStorage wrapper（view 外讀取語意未定義），直讀 UserDefaults。
+    nonisolated private static func selectedRecipeID() -> String {
+        UserDefaults.standard.string(forKey: "look.selected") ?? LookRecipe.passthrough.id
+    }
+
+    /// 目前選中 recipe（查無 id 時回 passthrough，防呆）。Metal 預覽逐帧呼叫。
+    nonisolated private static func currentPreviewRecipe() -> LookRecipe {
+        let id = selectedRecipeID()
+        return LookRecipe.all.first { $0.id == id } ?? .passthrough
+    }
+
+    /// captureLookProvider 用：原色（passthrough）回 nil = 拍照不套 Look（A2 契約）。
+    nonisolated private static func currentCaptureLook() -> LookRecipe? {
+        let recipe = currentPreviewRecipe()
+        return recipe.id == LookRecipe.passthrough.id ? nil : recipe
+    }
+
+    /// look.autoApply 開時每 5s 呼叫：自動切到推薦 top-1。
+    /// 手動選過後 30s 內不搶；只在 Look 列可見的模式（拍照/教練）動作。
+    private func autoApplyTopLook() {
+        guard lookAutoApply, mode == .photo || mode == .coach else { return }
+        guard Date().timeIntervalSince(lastManualLookAt) >= 30 else { return }
+        guard let top = LookSuggester.shared.suggestedIDs.first,
+              top != selectedLookID,
+              LookRecipe.all.contains(where: { $0.id == top })
+        else { return }
+        withAnimation(Tokens.springAppear) {
+            selectedLookID = top
+        }
     }
 
     // MARK: - 快門白閃
@@ -280,5 +413,209 @@ struct RootView: View {
     private func openSystemPhotoAlbum() {
         guard let url = URL(string: "photos-redirect://") else { return }
         UIApplication.shared.open(url, options: [:]) { _ in }
+    }
+}
+
+// MARK: - Look 選擇列（A4；只在拍照/教練模式顯示）
+
+/// 橫向 scroll 膠囊 chips：「原色」＋12 款 Look。
+/// 選中＝白底黑字；LookSuggester 推薦前 3 名 chip 右上白點徽記（選中者不畫，
+/// 白點在白底上不可見）。點選 → selection haptic ＋ 寫入 AppStorage；
+/// 選中變化（含自動選 Look）時自動捲到可見位置。
+@MainActor
+private struct LookBar: View {
+    @Binding var selectedID: String
+    /// 用戶手動點選時回呼（RootView 記時刻，供自動選 Look 30s 禮讓）。
+    let onManualSelect: () -> Void
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(LookRecipe.all) { recipe in
+                        chip(recipe)
+                            .id(recipe.id)
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 2)
+            }
+            .onChange(of: selectedID) { _, newID in
+                withAnimation(Tokens.springAppear) {
+                    proxy.scrollTo(newID, anchor: .center)
+                }
+            }
+        }
+    }
+
+    private func chip(_ recipe: LookRecipe) -> some View {
+        let isSelected = recipe.id == selectedID
+        let isSuggested = LookSuggester.shared.suggestedIDs.contains(recipe.id)
+        return Button {
+            guard !isSelected else { return }
+            UISelectionFeedbackGenerator().selectionChanged()
+            onManualSelect()
+            withAnimation(Tokens.springFast) {
+                selectedID = recipe.id
+            }
+        } label: {
+            Text(recipe.name)
+                .font(Tokens.label(12, weight: isSelected ? .semibold : .regular))
+                .foregroundStyle(isSelected ? Tokens.bg : Tokens.fg)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 5)
+                .background {
+                    if isSelected {
+                        Capsule().fill(Tokens.fg)
+                    } else {
+                        Capsule()
+                            .fill(.ultraThinMaterial)
+                            .environment(\.colorScheme, .dark)
+                    }
+                }
+                .overlay(
+                    Capsule().strokeBorder(
+                        isSelected ? Color.clear : Tokens.glassHairline,
+                        lineWidth: Tokens.hairline
+                    )
+                )
+                .overlay(alignment: .topTrailing) {
+                    if isSuggested && !isSelected {
+                        Circle()
+                            .fill(Tokens.fg)
+                            .frame(width: 5, height: 5)
+                            .shadow(color: Tokens.softShadow, radius: 2)
+                            .offset(x: 1, y: -1)
+                    }
+                }
+                .shadow(color: Tokens.softShadow, radius: 8, x: 0, y: 2)
+        }
+        .buttonStyle(.plain)
+        .animation(Tokens.springFast, value: isSelected)
+        .accessibilityLabel("濾鏡 \(recipe.name)")
+    }
+}
+
+// MARK: - LookSuggester 餵料（零尺寸 view，隔離 15fps facts 觀察）
+
+/// CoachSession 每次 publish（facts 變化）→ LookSuggester.ingest。
+/// 獨立小 view：facts ~15fps 逐帧變，觀察範圍只限這裡，不讓 RootView 大 body 逐帧 diff。
+/// hasFace 走 LookSuggester.ingest 的同名參數（v0.3.0 修正輪：舊版附加 "face"
+/// sceneTags tag，但 suggester 的關鍵字表沒有 "face" → 人像優先規則從未觸發）。
+@MainActor
+private struct LookSuggestionFeeder: View {
+    let session: CoachSession
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .allowsHitTesting(false)
+            .onChange(of: session.facts) { _, newFacts in
+                guard let facts = newFacts else { return }
+                LookSuggester.shared.ingest(
+                    sceneTags: facts.sceneTags,
+                    histogram: facts.histogram,
+                    hasFace: !facts.faces.isEmpty
+                )
+            }
+    }
+}
+
+// MARK: - 教練 HUD（取景器內、克制；facts 只在教練模式發布 → 其他模式自動隱藏）
+
+@MainActor
+private struct CoachHUD: View {
+    let session: CoachSession
+
+    var body: some View {
+        ZStack {
+            HorizonLevelHUD(session: session)
+            OverexposureBadge(session: session)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                .padding(.top, 56)
+                .padding(.trailing, 16)
+        }
+    }
+}
+
+/// 水平儀：|roll| < 6° 且未水平時顯示中央短橫線（旋轉 roll 角、gray2）；
+/// |roll| < 0.8° 時 snap 成白色＋輕 haptic（每次進入水平只觸發一次）、
+/// 0.8s 後淡出。離開水平（1.0° 遲滯）重置，可再次觸發。
+@MainActor
+private struct HorizonLevelHUD: View {
+    let session: CoachSession
+
+    /// 已進入水平狀態（白線＋haptic 已觸發、淡出已排程）。
+    @State private var leveled = false
+    /// 淡出旗標（leveled 後延遲 0.8s 淡出）。
+    @State private var fadedOut = false
+
+    var body: some View {
+        let roll = session.facts?.horizonRollDeg
+        ZStack {
+            if let roll, abs(roll) < 6 {
+                Capsule()
+                    .fill(leveled ? Tokens.fg : Tokens.gray2)
+                    .frame(width: 72, height: 1.5)
+                    .shadow(color: Color.black.opacity(0.5), radius: 1)
+                    .rotationEffect(.degrees(roll))
+                    .animation(Tokens.tween, value: roll)
+                    .opacity(fadedOut ? 0 : 1)
+            }
+        }
+        // facts 消失（離開教練模式）以 .infinity 代入 → 走重置分支。
+        .onChange(of: roll ?? .infinity) { _, newValue in
+            update(roll: newValue)
+        }
+    }
+
+    private func update(roll: Double) {
+        let magnitude = abs(roll)
+        if leveled {
+            // 離開水平（1.0° 遲滯，避免 0.8° 臨界抖動反覆觸發 haptic）→ 重置
+            if magnitude > 1.0 {
+                leveled = false
+                fadedOut = false
+            }
+        } else if magnitude < 0.8 {
+            leveled = true          // 顏色 snap 成白（無動畫補間）
+            fadedOut = false
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            withAnimation(.easeOut(duration: 0.25).delay(0.8)) {
+                fadedOut = true     // 停留 0.8s 後 0.25s 淡出
+            }
+        }
+    }
+}
+
+/// 過曝章：histogram highlightClippedFraction > 0.10 顯示右上「過曝」小章。
+/// 遲滯（>10% 顯示、<8% 隱藏）避免臨界值閃爍。
+@MainActor
+private struct OverexposureBadge: View {
+    let session: CoachSession
+
+    @State private var visible = false
+
+    var body: some View {
+        let fraction = session.facts?.histogram?.highlightClippedFraction ?? 0
+        ZStack {
+            if visible {
+                Text("過曝")
+                    .font(Tokens.label(11, weight: .medium))
+                    .foregroundStyle(Tokens.gray1)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 4)
+                    .dsGlassCapsule()
+                    .transition(.scale(scale: 0.9).combined(with: .opacity))
+            }
+        }
+        .animation(Tokens.springAppear, value: visible)
+        .onChange(of: fraction) { _, newValue in
+            if !visible, newValue > 0.10 {
+                visible = true
+            } else if visible, newValue < 0.08 {
+                visible = false
+            }
+        }
     }
 }

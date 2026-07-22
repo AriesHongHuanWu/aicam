@@ -7,10 +7,11 @@
 //
 //  P0 流程：didFinishProcessingPhoto 取 fileDataRepresentation()（HEIF 或 JPEG）
 //  → didFinishCaptureFor 收尾，把 data 交回 completion（保證恰好呼叫一次）。
-//  後續（存相簿 / 縮圖 / 1280px JPEG）由 CameraController 統籌。
+//  後續（存相簿 / 縮圖 / 1280px JPEG / v0.3.0 Look 烘焙）由 CameraController 統籌。
 
 import AVFoundation
 import UIKit
+import AICamCore
 
 /// 一次 capturePhoto 的 delegate。completion 恰好呼叫一次；失敗時給 nil。
 final class PhotoCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegate, @unchecked Sendable {
@@ -68,6 +69,14 @@ enum CapturedPhotoProcessor {
             thumbnail: thumbnail,
             coachJPEG: coach?.jpegData(compressionQuality: 0.85)
         )
+    }
+
+    /// Look 烘焙（v0.3.0）：原始拍照 data（HEIF/JPEG）→ 帶 Look 的 JPEG。
+    /// quality 0.92（存相簿等級）；失敗回 nil，呼叫端 fallback 存原檔。
+    /// 任意背景執行緒可呼叫（LookEngine.renderJPEG 為純函式語意）。
+    /// 呼叫端（CameraController.capturePhoto）已保證 recipe 非 passthrough。
+    static func bakeLook(into data: Data, recipe: LookRecipe) -> Data? {
+        LookEngine.renderJPEG(from: data, recipe: recipe, quality: 0.92)
     }
 
     /// 等比縮到長邊 = longestSide（原圖較小則原尺寸重繪）。

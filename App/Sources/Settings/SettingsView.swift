@@ -2,6 +2,8 @@
 //  AICam — 設定頁（跨模組契約，A4 擁有；本輪 A3 依契約重排 + 實作模型選擇 UI）。
 //
 //  區塊：AI 導演（開關 / Gemini API Key / 模型選擇 / 測試連線）、
+//        AI 智慧（構圖模型 / AI 代操曝光，v0.3.0）、
+//        調色（即時濾鏡預覽 / AI 自動選 Look / 同時保留原圖，v0.3.0）、
 //        教練（自動抓拍 / 導演即時建議，P2）、
 //        拍攝（網格線 P0 佔位）、關於（版本）。
 //  模型選擇（跨模組契約）：
@@ -31,6 +33,13 @@ struct SettingsView: View {
     @AppStorage("director.live") private var directorLive = false
     @AppStorage("coach.autoCapture") private var coachAutoCapture = false
     @AppStorage("grid.enabled") private var gridEnabled = false
+    /// v0.3.0 AI 智慧（跨模組契約 keys；預設皆 true）。
+    @AppStorage("coach.model.enabled") private var coachModelEnabled = true
+    @AppStorage("ai.control.enabled") private var aiControlEnabled = true
+    /// v0.3.0 調色（跨模組契約 keys）。
+    @AppStorage("look.livePreview") private var lookLivePreview = true
+    @AppStorage("look.autoApply") private var lookAutoApply = false
+    @AppStorage("look.keepOriginal") private var lookKeepOriginal = false
 
     // MARK: - 畫面狀態
 
@@ -60,6 +69,8 @@ struct SettingsView: View {
         NavigationStack {
             Form {
                 directorSection
+                aiSection
+                lookSection
                 coachSection
                 captureSection
                 aboutSection
@@ -214,6 +225,83 @@ struct SettingsView: View {
             }
         }
         .animation(Tokens.springAppear, value: connectionTest)
+    }
+
+    // MARK: - AI 智慧（v0.3.0）
+
+    private var aiSection: some View {
+        Section {
+            Toggle(isOn: $coachModelEnabled) {
+                HStack(spacing: 12) {
+                    iconTile("sparkles")
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("AI 構圖模型")
+                        Text("教練模式以本機模型輔助構圖評分")
+                            .font(Tokens.label(12))
+                            .foregroundStyle(Tokens.gray2)
+                    }
+                }
+            }
+            .tint(Tokens.gray2)
+
+            Toggle(isOn: $aiControlEnabled) {
+                HStack(spacing: 12) {
+                    iconTile("sun.max")
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("AI 代操曝光")
+                        Text("逆光、過曝時自動微調，可隨時復原")
+                            .font(Tokens.label(12))
+                            .foregroundStyle(Tokens.gray2)
+                    }
+                }
+            }
+            .tint(Tokens.gray2)
+        } header: {
+            sectionHeader("AI 智慧")
+        } footer: {
+            Text("構圖模型全程在本機執行（驗證集 0.865）；模型分數是相對排序參考、非絕對品質。AI 代操的每個動作都會在取景器顯示提示，並可一鍵復原。")
+                .font(Tokens.label(12))
+                .foregroundStyle(Tokens.gray2)
+        }
+        .listRowBackground(Self.rowBackground)
+        .listRowSeparatorTint(Tokens.hairlineColor)
+    }
+
+    // MARK: - 調色（v0.3.0）
+
+    private var lookSection: some View {
+        Section {
+            Toggle(isOn: $lookLivePreview) {
+                settingLabel("即時濾鏡預覽", icon: "camera.filters")
+            }
+            .tint(Tokens.gray2)
+
+            Toggle(isOn: $lookAutoApply) {
+                HStack(spacing: 12) {
+                    iconTile("wand.and.rays")
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("AI 自動選 Look")
+                        Text("依場景自動切換推薦 Look")
+                            .font(Tokens.label(12))
+                            .foregroundStyle(Tokens.gray2)
+                    }
+                }
+            }
+            .tint(Tokens.gray2)
+
+            Toggle(isOn: $lookKeepOriginal) {
+                settingLabel("同時保留原圖", icon: "square.on.square")
+            }
+            .tint(Tokens.gray2)
+        } header: {
+            sectionHeader("調色")
+        } footer: {
+            Text("即時濾鏡預覽在取景器直接呈現選中 Look，關閉可省電。同時保留原圖會在套用 Look 時額外儲存一張未調色的原始照片。")
+                .font(Tokens.label(12))
+                .foregroundStyle(Tokens.gray2)
+        }
+        .listRowBackground(Self.rowBackground)
+        .listRowSeparatorTint(Tokens.hairlineColor)
     }
 
     // MARK: - 教練

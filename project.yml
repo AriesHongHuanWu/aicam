@@ -30,6 +30,8 @@ targets:
       path: App/Info.plist
       properties:
         CFBundleDisplayName: AICam
+        CFBundleShortVersionString: 0.3.0
+        CFBundleVersion: "3"
         NSCameraUsageDescription: AICam 需要相機權限才能取景與拍攝。
         NSPhotoLibraryAddUsageDescription: AICam 需要權限把拍好的照片存入你的相簿。
         UILaunchScreen: {}

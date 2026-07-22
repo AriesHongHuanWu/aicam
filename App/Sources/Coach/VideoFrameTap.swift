@@ -7,6 +7,9 @@
 //  - latestPixelBuffer / isActive / isFrontCamera / minAnalysisInterval 由 NSLock 保護：
 //    MainActor（snapshot、開關、熱降級）與 sessionQueue（前後鏡標記）都會跨執行緒存取。
 //  - onFacts 於 analysisQueue 上呼叫；由 CoachSession 在啟用前設定一次、之後不再改。
+//  - onPreviewFrame（v0.3.0 A3 契約）於 analysisQueue 上「每帧」呼叫（~30fps，
+//    不受分析節流、也不受 setActive 限制 — 非教練模式掛 tap 純做即時濾鏡預覽
+//    也要出帧）；MetalPreviewView 動態設定/清除 → 同一把鎖保護。nil 時零成本。
 //
 //  座標鐵律（MASTER-PLAN §3 + 本輪契約）：
 //  - connection 已設 videoRotationAngle=90（CameraController.attachVideoTap / configureLocked）
@@ -36,6 +39,46 @@ final class VideoFrameTap: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     /// CoachOverlayView 的 AspectFillMapper 不再寫死 3:4。
     var onFacts: ((FrameFacts, _ bufferWidth: Int, _ bufferHeight: Int) -> Void)?
 
+    /// 即時濾鏡預覽回呼（v0.3.0 A3 契約）：設定後「每帧」在 delegate queue
+    /// （analysisQueue）上回呼，帶原始 CVPixelBuffer（已直立、前鏡已鏡像）；
+    /// 不經分析節流（濾鏡預覽要滿帧率 ~30fps，分析只要 15fps）、不受 setActive
+    /// 影響（教練關閉時 Metal 取景器照樣要畫）。nil 時零成本（captureOutput
+    /// 只多一次鎖內指標讀取）。MetalPreviewView 擁有設定與清除。
+    var onPreviewFrame: ((CVPixelBuffer) -> Void)? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return _onPreviewFrame
+        }
+        set {
+            lock.lock()
+            _onPreviewFrame = newValue
+            _previewFrameOwner = nil
+            lock.unlock()
+        }
+    }
+
+    /// onPreviewFrame 的「帶擁有者」設定版（v0.3.0 修正輪）：搭配
+    /// clearPreviewFrameHandler(owner:) 使用。SwiftUI 重建 MetalPreviewView 時
+    /// 舊 Coordinator 的 detach/deinit 可能晚於新 Coordinator 的 attach 執行 —
+    /// 無條件清空會把新回呼一併抹掉（預覽靜默凍結）。擁有者比對根治此時序。
+    func setPreviewFrameHandler(_ handler: @escaping (CVPixelBuffer) -> Void, owner: AnyObject) {
+        lock.lock()
+        _onPreviewFrame = handler
+        _previewFrameOwner = ObjectIdentifier(owner)
+        lock.unlock()
+    }
+
+    /// 只在回呼仍屬於 owner 時清除（不屬於 = 已被新擁有者接手 → 不動）。
+    func clearPreviewFrameHandler(owner: AnyObject) {
+        lock.lock()
+        if _previewFrameOwner == ObjectIdentifier(owner) {
+            _onPreviewFrame = nil
+            _previewFrameOwner = nil
+        }
+        lock.unlock()
+    }
+
     /// Vision + 像素統計 + CoreMotion（analyze 只在 analysisQueue 上跑）。
     let analyzer = FrameAnalyzer()
 
@@ -50,6 +93,10 @@ final class VideoFrameTap: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     private var _isActive = false
     private var _isFrontCamera = false
     private var _minAnalysisInterval: Double = 0.066
+    private var _onPreviewFrame: ((CVPixelBuffer) -> Void)?
+    /// 目前 onPreviewFrame 的擁有者（setPreviewFrameHandler 設定；
+    /// 經 property setter 設定時為 nil）。時序防護見 setPreviewFrameHandler 注釋。
+    private var _previewFrameOwner: ObjectIdentifier?
 
     // MARK: - analysisQueue 專屬狀態（不需鎖）
 
@@ -114,7 +161,13 @@ final class VideoFrameTap: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         }
         let front = _isFrontCamera
         let interval = _minAnalysisInterval
+        let previewCallback = _onPreviewFrame
         lock.unlock()
+
+        // 即時濾鏡預覽（A3）：每帧、先於分析節流 — 預覽要滿帧率，分析只要 15fps。
+        // 回呼內只存 buffer 引用 + 排主執行緒重繪（見 MetalPreviewView），
+        // 不在此 queue 做任何濾鏡運算。
+        previewCallback?(pixelBuffer)
 
         // 節流：未啟用／分析中（同 queue 理論上不會發生，防禦用）／距上次分析 < interval → 丟帧
         guard active, !isBusy, timestamp - lastAnalysisTime >= interval else { return }
@@ -126,6 +179,16 @@ final class VideoFrameTap: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     }
 
     // MARK: - 快照
+
+    /// 最新分析帧的 buffer 引用（鎖內一行讀取；教練停用或尚無帧時 nil）。
+    /// Reframe 模型 tick 直餵 scorer 用（v0.3.0 修正輪：取代 snapshotJPEG 繞路，
+    /// 免去每 tick 一次 JPEG 編解碼與其壓縮噪聲）。onFacts 於 captureOutput 內
+    /// 同 queue 同步呼叫時，回傳值恰為本帧。
+    func latestAnalysisBuffer() -> CVPixelBuffer? {
+        lock.lock()
+        defer { lock.unlock() }
+        return latestPixelBuffer
+    }
 
     /// 最新帧同步轉 JPEG（呼叫端執行緒執行；buffer 已直立且與 preview 同向、前鏡已鏡像）。
     /// maxDimension = 長邊上限（pt 無關，純像素）；無帧時回 nil。
