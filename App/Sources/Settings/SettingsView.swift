@@ -2,7 +2,7 @@
 //  AICam — 設定頁（跨模組契約，A4 擁有；本輪 A3 依契約重排 + 實作模型選擇 UI）。
 //
 //  區塊：AI 導演（開關 / Gemini API Key / 模型選擇 / 測試連線）、
-//        AI 智慧（構圖模型 / AI 代操曝光，v0.3.0）、
+//        AI 智慧（構圖模型 / AI 代操曝光，v0.3.0；AI 自動變焦 / 變焦建議，v0.4.0）、
 //        調色（即時濾鏡預覽 / AI 自動選 Look / 同時保留原圖，v0.3.0）、
 //        教練（自動抓拍 / 導演即時建議，P2）、
 //        拍攝（網格線 P0 佔位）、關於（版本）。
@@ -36,6 +36,12 @@ struct SettingsView: View {
     /// v0.3.0 AI 智慧（跨模組契約 keys；預設皆 true）。
     @AppStorage("coach.model.enabled") private var coachModelEnabled = true
     @AppStorage("ai.control.enabled") private var aiControlEnabled = true
+    /// v0.4.0 AI 變焦（跨模組契約 keys）：enabled 預設 false（代操須主動開啟）、
+    /// suggest 預設 true。預設值必須與 AIControlCenter 讀法一致 —
+    /// 它以 object(forKey:) 判「無值」套同樣預設，@AppStorage 宣告的預設值
+    /// 不會寫入 UserDefaults，兩端語意相容。
+    @AppStorage("ai.zoom.enabled") private var aiZoomEnabled = false
+    @AppStorage("ai.zoom.suggest") private var aiZoomSuggest = true
     /// v0.3.0 調色（跨模組契約 keys）。
     @AppStorage("look.livePreview") private var lookLivePreview = true
     @AppStorage("look.autoApply") private var lookAutoApply = false
@@ -256,10 +262,36 @@ struct SettingsView: View {
                 }
             }
             .tint(Tokens.gray2)
+
+            Toggle(isOn: $aiZoomEnabled) {
+                HStack(spacing: 12) {
+                    iconTile("plus.magnifyingglass")
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("AI 自動變焦")
+                        Text("人像距離合適時自動切換 2x，可隨時復原")
+                            .font(Tokens.label(12))
+                            .foregroundStyle(Tokens.gray2)
+                    }
+                }
+            }
+            .tint(Tokens.gray2)
+
+            Toggle(isOn: $aiZoomSuggest) {
+                HStack(spacing: 12) {
+                    iconTile("text.magnifyingglass")
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("AI 變焦建議")
+                        Text("僅在取景器提示建議焦段，按「套用」才生效")
+                            .font(Tokens.label(12))
+                            .foregroundStyle(Tokens.gray2)
+                    }
+                }
+            }
+            .tint(Tokens.gray2)
         } header: {
             sectionHeader("AI 智慧")
         } footer: {
-            Text("構圖模型全程在本機執行（驗證集 0.865）；模型分數是相對排序參考、非絕對品質。AI 代操的每個動作都會在取景器顯示提示，並可一鍵復原。")
+            Text("構圖模型全程在本機執行（驗證集 0.865）；模型分數是相對排序參考、非絕對品質。AI 代操的每個動作都會在取景器顯示提示，並可一鍵復原。自動變焦會直接代操焦段；關閉時仍可保留變焦建議，由你決定是否套用。")
                 .font(Tokens.label(12))
                 .foregroundStyle(Tokens.gray2)
         }
@@ -336,7 +368,7 @@ struct SettingsView: View {
         } header: {
             sectionHeader("教練")
         } footer: {
-            Text("教練模式的目標環與分數環永遠在本機即時計算，不需網路。")
+            Text("教練模式採用測距儀式導引：朝白色標記點方向轉動手機，讓它滑進中央準星即完成構圖。導引由 Vision 與陀螺儀即時融合，連同分數全程在本機計算，不需網路。")
                 .font(Tokens.label(12))
                 .foregroundStyle(Tokens.gray2)
         }

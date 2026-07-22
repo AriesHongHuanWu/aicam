@@ -20,6 +20,13 @@
 //    setPreviewFramesEnabled（Metal 預覽）任一需要即出帧，互不誤關。
 //  - 重配（啟動/切鏡）時曝光狀態歸中性：AVCaptureDevice 是共享實例，
 //    bias / 測光點會跨 session 殘留，必須主動歸零。
+//
+//  v0.4.0（對準點導引 + AI 代操擴充）新增：
+//  - currentHorizontalFOVDegrees()：activeFormat.videoFieldOfView 鏡像
+//    （A2 陀螺儀角度→normalized 位移換算用；語意警告見方法注釋 — 直立顯示時
+//    此「水平」視角對應畫面的「垂直」方向）。
+//  - rampZoom(to:rate:)：AI 自動變焦（AIControlCenter 呼叫）；平滑 ramp、
+//    夾到裝置範圍、currentLens 同步為最接近焦段（LensBar 高亮跟著走）。
 
 import AVFoundation
 import Observation
@@ -210,6 +217,64 @@ final class CameraController {
         service.setExposurePoint(normalizedX: normalizedX, y: y)
     }
 
+    // MARK: - AI 代操變焦與 FOV（v0.4.0 契約；AIControlCenter / CoachSession 呼叫）
+
+    /// 當前 activeFormat 的水平視角（度）。session 尚未成功配置（或裝置回報 0）
+    /// 時回 nil — 呼叫端（A2）fallback 60°。
+    ///
+    /// 座標語意警告（v0.4.0 對準點導引換算最易錯處，逐步寫明）：
+    /// videoFieldOfView 是「感光元件原生 landscape 影像的橫向（長邊）」視角。
+    /// 本 app 直立 portrait 顯示（connection videoRotationAngle=90）→
+    /// 感光器長邊直立後成為畫面的「垂直」方向 — 亦即此值對應畫面 y 軸的視角；
+    /// 畫面 x 軸（水平）視角對應感光器短邊，需由呼叫端依帧長寬比換算
+    ///（A2 責任，本 API 只回裝置原始值，不做任何軸向換算）。
+    /// 另注意：此值是該 format 在 videoZoomFactor = 1.0 的基準 —
+    /// 數位變焦後有效視角 ≈ 2·atan(tan(FOV/2) / zoomFactor)；
+    /// 目前 zoom factor 讀 currentZoomFactor()（實際 videoZoomFactor 鏡像，
+    /// 非 currentLens 的量化焦段值 — 兩者在 ramp 到非焦段 factor 時不同，
+    /// 見 rampZoom / CaptureSessionService.zoomFactorMirror 注釋）。
+    ///
+    /// 同步、非阻塞：讀 service 鎖保護的鏡像值（configureAndStart 成功時更新），
+    /// 不碰 sessionQueue 隔離的 device 本體（與 currentExposureBias 同模式）。
+    func currentHorizontalFOVDegrees() -> Double? {
+        service.currentHorizontalFOVDegrees().map(Double.init)
+    }
+
+    /// 實際 videoZoomFactor（夾限後鏡像值；v0.4.0 修正輪）。
+    /// currentLens 只是「最接近焦段」的 UI 高亮近似 — FOV 換算與 AI 顯示倍率
+    /// 判斷必須讀本值（三鏡 Pro 上 2x = factor 4.0 時 currentLens 停在 1x@2.0，
+    /// 差 2 倍）。ramp 進行中回傳 ramp 目標值（漸進近似，注釋見 service）。
+    func currentZoomFactor() -> CGFloat {
+        service.currentZoomFactor()
+    }
+
+    /// 平滑 zoom 到指定 factor（AI 自動變焦；v0.4.0 契約）。
+    /// sessionQueue 上 ramp(toVideoZoomFactor:withRate:)，夾到裝置支援範圍；
+    /// 既有 select(lens:) 不動、不經過本方法。
+    ///
+    /// UI 狀態同步：currentLens 改為「最接近目標 factor」的 LensOption —
+    /// LensBar 既有高亮邏輯讀 currentLens 即自動生效，不改 UI 檔。
+    /// 焦段實際變化（目標 factor 偏離原 currentLens）時發 onCameraReconfigured，
+    /// 與 select(lens:) 同語意：取景範圍跳變，教練層須重置導引
+    ///（planner 凍結 target 的 normalized 座標在新視角下失效）。
+    func rampZoom(to factor: CGFloat, rate: Float) {
+        guard status == .running else { return }
+        // previousFactor 讀「實際」zoom 鏡像而非 currentLens 量化值：
+        // 三鏡 Pro ramp 到 2x（factor 4.0）後 currentLens 停在 1x@2.0，
+        // 用它比對會把「同值重 ramp」誤判為變化 → 每次誤發 onCameraReconfigured
+        // 清空教練導引／融合器。鏡像值同值重 ramp 時正確跳過通知。
+        let previousFactor = currentZoomFactor()
+        service.rampZoom(to: factor, rate: rate)
+        if let nearest = lensOptions.min(by: {
+            abs($0.zoomFactor - factor) < abs($1.zoomFactor - factor)
+        }) {
+            currentLens = nearest
+        }
+        if abs(previousFactor - factor) > 0.01 {
+            onCameraReconfigured?()
+        }
+    }
+
     // MARK: - 教練分析 tap（A5：CoachSession 掛載一次）
 
     /// 把教練層的 AVCaptureVideoDataOutput 接進 session（sessionQueue 上執行）；
@@ -285,6 +350,19 @@ final class CaptureSessionService: @unchecked Sendable {
     /// 同步讀 device 需 sessionQueue.sync（重配中會卡主執行緒）— 鏡像值可行
     /// 因為本 app 只有 AI 這一條寫入路徑（無手動曝光 UI），鏡像即真值。
     private var exposureBiasMirror: Float = 0
+    /// activeFormat.videoFieldOfView 鏡像（度；v0.4.0，stateLock 保護）。
+    /// configureLocked 成功 commit 後更新；nil = 尚未配置或裝置回報 0。
+    /// 語意警告見 CameraController.currentHorizontalFOVDegrees() 注釋。
+    private var horizontalFOVMirror: Float?
+    /// 實際 videoZoomFactor 鏡像（v0.4.0 修正輪；stateLock 保護）。
+    /// setZoom / rampZoom / configureLocked 更新為「夾限後的目標值」。
+    /// 為什麼不能用 currentLens?.zoomFactor 代替：currentLens 只是「最接近
+    /// 焦段」的量化值 — 三鏡 Pro（0.5x@1 / 1x@2 / 3x@6）ramp 到 2x（factor 4.0）
+    /// 時與 1x@2、3x@6 等距、min(by:) 取 1x → currentLens 讀 2.0 而實際 4.0，
+    /// FOV 換算錯 2 倍、AI 顯示倍率判斷恆 1.0（規則 e 每 20s 重複觸發）。
+    /// 已知近似：ramp 是漸進的，鏡像存的是 ramp「目標值」— ramp 進行中
+    /// （~1s）鏡像超前實際值；停在任何 factor 後即為精確值。
+    private var zoomFactorMirror: CGFloat = 1.0
 
     // MARK: 對外（任意 actor）
 
@@ -326,8 +404,11 @@ final class CaptureSessionService: @unchecked Sendable {
                     device.videoZoomFactor = clamped
                 }
                 device.unlockForConfiguration()
+                self.stateLock.lock()
+                self.zoomFactorMirror = clamped
+                self.stateLock.unlock()
             } catch {
-                // lock 失敗：放棄本次 zoom，不影響 session
+                // lock 失敗：本次 zoom 不套用、鏡像值不更新（保持一致）
             }
         }
     }
@@ -358,6 +439,43 @@ final class CaptureSessionService: @unchecked Sendable {
         stateLock.lock()
         defer { stateLock.unlock() }
         return exposureBiasMirror
+    }
+
+    /// activeFormat 水平視角鏡像（度；任意執行緒；stateLock 保護、非阻塞；v0.4.0）。
+    func currentHorizontalFOVDegrees() -> Float? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return horizontalFOVMirror
+    }
+
+    /// 平滑 zoom（v0.4.0 AI 自動變焦）：sessionQueue 上夾到裝置範圍後 ramp。
+    /// rate 單位 = zoom factor 的 2 的冪次／秒（AVFoundation 語意）。
+    func rampZoom(to factor: CGFloat, rate: Float) {
+        sessionQueue.async {
+            guard let device = self.videoInput?.device else { return }
+            do {
+                try device.lockForConfiguration()
+                let clamped = min(
+                    max(factor, device.minAvailableVideoZoomFactor),
+                    device.maxAvailableVideoZoomFactor
+                )
+                device.ramp(toVideoZoomFactor: clamped, withRate: rate)
+                device.unlockForConfiguration()
+                self.stateLock.lock()
+                self.zoomFactorMirror = clamped
+                self.stateLock.unlock()
+            } catch {
+                // lock 失敗：本次 zoom 不套用、鏡像值不更新（保持一致）
+            }
+        }
+    }
+
+    /// 實際 videoZoomFactor 鏡像值（任意執行緒；stateLock 保護、非阻塞；
+    /// v0.4.0 修正輪）。ramp 進行中為目標值（注釋見 zoomFactorMirror）。
+    func currentZoomFactor() -> CGFloat {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return zoomFactorMirror
     }
 
     /// 曝光測光點（v0.3.0）。輸入 NormalizedFrame（直立顯示帧頂左原點、前鏡已鏡像）。
@@ -530,15 +648,19 @@ final class CaptureSessionService: @unchecked Sendable {
 
         // 預設鏡位 zoom：有超廣角的 virtual device 1.0 = 0.5x，
         // 直接把 1x（第一個 switchover）設成起始 zoom，避免開場是超廣角。
+        // appliedZoom 同步進 zoomFactorMirror（重配 = zoom 狀態重來）。
+        var appliedZoom: CGFloat = 1.0
         if let defaultLens = DeviceMatrix.defaultLens(in: options),
            defaultLens.zoomFactor != 1.0 {
             do {
                 try device.lockForConfiguration()
-                device.videoZoomFactor = min(
+                let clamped = min(
                     max(defaultLens.zoomFactor, device.minAvailableVideoZoomFactor),
                     device.maxAvailableVideoZoomFactor
                 )
+                device.videoZoomFactor = clamped
                 device.unlockForConfiguration()
+                appliedZoom = clamped
             } catch {
                 // 失敗就維持 1.0，UI 仍可手動選鏡
             }
@@ -563,6 +685,7 @@ final class CaptureSessionService: @unchecked Sendable {
         }
         stateLock.lock()
         exposureBiasMirror = 0
+        zoomFactorMirror = appliedZoom
         stateLock.unlock()
 
         // 直向固定：session 內所有支援的 connection（含已附掛的 preview layer）都轉 90°
@@ -575,6 +698,15 @@ final class CaptureSessionService: @unchecked Sendable {
         configureVideoTapConnectionLocked(front: front)
 
         session.commitConfiguration()
+
+        // FOV 鏡像更新（v0.4.0）：commit 後 activeFormat 才確定（sessionPreset
+        // 於 commit 時真正套用），不能在 begin/commit 之間讀。
+        // videoFieldOfView 語意警告見 CameraController.currentHorizontalFOVDegrees()。
+        let fov = device.activeFormat.videoFieldOfView
+        stateLock.lock()
+        horizontalFOVMirror = fov > 0 ? fov : nil
+        stateLock.unlock()
+
         return options
     }
 

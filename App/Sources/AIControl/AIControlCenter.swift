@@ -15,8 +15,24 @@
 //  d) 條件（a、b）皆解除且 bias ≠ 0 持續 ≥3s → bias 緩步歸零（每次 0.35，
 //     餘量 ≤0.35 時直接落 0 收尾）。
 //
-//  節流：所有動作共用「任兩次動作間隔 ≥2.5s」的全域閘（c 另加自身 ≥4s）；
-//  bias 值變化 < 0.15 EV 不動作（歸零收尾步例外 — 回到中性即結束介入）。
+//  規則（v0.4.0 擴充）：
+//  e) 人像焦段：後鏡有臉、臉高 0.12–0.28（<0.12 = 人太小/太遠，跳過）、
+//     顯示倍率 < 1.8x、主體距離（有值時）> 1.6m → 2x（人像壓縮）。
+//     ai.zoom.enabled（預設 false）= 直接 rampZoom 代操（可還原）；
+//     否則 ai.zoom.suggest（預設 true）= 建議 toast，AIAction 帶 apply 閉包
+//     （toast 顯示「套用」鈕；按下才 rampZoom，之後轉為可還原 toast）。
+//     自身 rate-limit ≥20s。顯示倍率 = camera.currentZoomFactor() / 主鏡(1x)
+//     factor（實際 videoZoomFactor 鏡像；超廣角 virtual device 下
+//     device factor ≠ 顯示倍率）。
+//  f) 低光處置：histogram 中位亮度 < 0.18 持續 ≥3s →「光線不足」提示
+//     （純 toast，不動參數）；若 bias > 0 先歸零（低光下正補償只會拉長快門
+//     更晃 — 註：a 的逆光條件在中位 <0.18 時數學上不可能成立，臉亮度 ≥0
+//     無法低於 median−0.18<0，兩規則不會互搶）。自身 rate-limit ≥30s。
+//
+//  節流：所有動作共用「任兩次動作間隔 ≥2.5s」的全域閘（c 另加自身 ≥4s、
+//  e ≥20s、f ≥30s）；bias 值變化 < 0.15 EV 不動作（歸零收尾步例外 —
+//  回到中性即結束介入）。e 的「建議」雖不動參數，仍佔全域閘與 toast slot
+//  （避免建議 toast 被下一動作瞬間蓋掉、用戶來不及按「套用」）。
 //
 //  衝突策略（v1）：AI 只在教練模式動作 — evaluate 僅由 CoachSession publish 觸發，
 //  其他模式沒有 facts 流；app 亦無手動曝光 UI，無用戶手動操作衝突面。
@@ -33,6 +49,21 @@ import AICamCore
 struct AIAction: Equatable {
     let text: String
     let date: Date
+    /// v0.4.0：建議型動作的「套用」閉包。nil = 已執行的動作（toast 顯示「還原」）；
+    /// 非 nil = 尚未執行的建議（toast 顯示「套用」）。MainActor 上建立、
+    /// 由 toast 按鈕（MainActor）呼叫；不參與 Equatable（閉包不可比，
+    /// 以 text+date 為身分 — date 每次動作都是新值，語意足夠）。
+    let apply: (() -> Void)?
+
+    init(text: String, date: Date, apply: (() -> Void)? = nil) {
+        self.text = text
+        self.date = date
+        self.apply = apply
+    }
+
+    static func == (lhs: AIAction, rhs: AIAction) -> Bool {
+        lhs.text == rhs.text && lhs.date == rhs.date
+    }
 }
 
 @MainActor
@@ -41,7 +72,7 @@ final class AIControlCenter {
 
     static let shared = AIControlCenter()
 
-    /// 最新一次 AI 動作；nil = toast 不顯示。動作後 5s 自動清空（淡出）。
+    /// 最新一次 AI 動作；nil = toast 不顯示。動作 5s / 建議（帶 apply）8s 自動清空（淡出）。
     private(set) var latestAction: AIAction?
 
     /// 相機接線（A4 於 RootView .task 設定）。weak：不影響 camera 生命週期。
@@ -51,6 +82,16 @@ final class AIControlCenter {
     /// UserDefaults 無值時視為 true，不能用 bool(forKey:) 的預設 false）。
     var isEnabled: Bool {
         (UserDefaults.standard.object(forKey: "ai.control.enabled") as? Bool) ?? true
+    }
+
+    /// 「AI 自動變焦」（key "ai.zoom.enabled"，預設 false — bool(forKey:) 即可）。
+    private var isAutoZoomEnabled: Bool {
+        UserDefaults.standard.bool(forKey: "ai.zoom.enabled")
+    }
+
+    /// 「AI 變焦建議」（key "ai.zoom.suggest"，預設 true — 無值視為 true）。
+    private var isZoomSuggestEnabled: Bool {
+        (UserDefaults.standard.object(forKey: "ai.zoom.suggest") as? Bool) ?? true
     }
 
     // MARK: - 規則常數
@@ -75,6 +116,18 @@ final class AIControlCenter {
     private static let restoreStepEV: Float = 0.35
     /// undo 後冷靜期（秒）：期間 evaluate 不動作。
     private static let undoCooldown = 10.0
+    /// e) 人像焦段：臉高範圍、顯示倍率上限、主體距離下限（公尺）、自身間隔（秒）。
+    private static let zoomFaceHeightMin = 0.12
+    private static let zoomFaceHeightMax = 0.28
+    private static let zoomMaxDisplayZoom = 1.8
+    private static let zoomMinSubjectDistanceM = 1.6
+    private static let zoomSuggestInterval = 20.0
+    /// e) ramp 速率（2 的冪次／秒）：比手動選鏡（rate 5）慢，AI 介入更從容可辨。
+    private static let zoomRampRate: Float = 3.0
+    /// f) 低光：中位亮度門檻、持續秒數、自身間隔（秒）。
+    private static let lowLightMedianThreshold = 0.18
+    private static let lowLightDwell = 3.0
+    private static let lowLightInterval = 30.0
 
     // MARK: - 內部狀態（MainActor；時間軸 = facts.timestamp）
 
@@ -84,6 +137,12 @@ final class AIControlCenter {
     @ObservationIgnored private var lastMeteringPoint: NPoint?
     /// a、b 條件皆解除的起始時間戳；條件重現或 bias 歸零時清空。
     @ObservationIgnored private var clearedSince: Double?
+    /// e) 上次變焦建議/代操時間戳（media clock）。
+    @ObservationIgnored private var lastZoomSuggestAt: Double = -.greatestFiniteMagnitude
+    /// f) 低光條件成立的起始時間戳；亮度回升時清空。
+    @ObservationIgnored private var lowLightSince: Double?
+    /// f) 上次低光提示時間戳。
+    @ObservationIgnored private var lastLowLightAt: Double = -.greatestFiniteMagnitude
     @ObservationIgnored private var suppressedUntil: Double = -.greatestFiniteMagnitude
     @ObservationIgnored private var lastEvaluateAt: Double = 0
     /// 前後鏡偵測（以 facts 流自偵測，不佔用 camera.onCameraReconfigured —
@@ -108,6 +167,7 @@ final class AIControlCenter {
         if let last = lastIsFront, last != facts.isFrontCamera {
             lastMeteringPoint = nil
             clearedSince = nil
+            lowLightSince = nil
             undo = nil
         }
         lastIsFront = facts.isFrontCamera
@@ -126,6 +186,15 @@ final class AIControlCenter {
             if clearedSince == nil { clearedSince = now }
         } else {
             clearedSince = nil
+        }
+
+        // f) 低光 dwell 計時（同樣獨立於動作節流）：中位亮度 <0.18 → 起算；
+        // 回升或無直方圖 → 清零（缺數據不判低光，誠實原則）。
+        let sceneMedian = facts.histogram.flatMap(Self.medianLuma)
+        if let sceneMedian, sceneMedian < Self.lowLightMedianThreshold {
+            if lowLightSince == nil { lowLightSince = now }
+        } else {
+            lowLightSince = nil
         }
 
         // ---- bias 規則（a / b / d 互斥；全域 ≥2.5s 一動）----
@@ -152,6 +221,88 @@ final class AIControlCenter {
                 performBias(next, from: bias, text: "AI：曝光還原", at: now)
                 actedThisTick = true
                 if next == 0 { clearedSince = nil }
+            }
+        }
+
+        // ---- f) 低光處置（v0.4.0；自身 ≥30s + 全域 ≥2.5s）----
+        // 純提示為主；bias > 0 時先歸零（低光下正補償拉長快門更晃、雜訊更重）。
+        // 與 a) 不互搶：中位 <0.18 時逆光條件（臉亮度 < 中位−0.18 < 0）數學上
+        // 不可能成立，見檔頭規則注釋。
+        if !actedThisTick,
+           let since = lowLightSince, now - since >= Self.lowLightDwell,
+           now - lastLowLightAt >= Self.lowLightInterval,
+           now - lastActionAt >= Self.actionInterval {
+            if bias > 0 {
+                camera.applyExposureBias(0)
+                undo = { [weak self] in
+                    self?.camera?.applyExposureBias(bias)
+                }
+                clearedSince = nil  // bias 已歸零，d) 的歸零計時作廢
+            } else {
+                undo = nil  // 純提示，無可還原之事（toast 端 apply 亦為 nil → 顯示還原鈕，按了只清 toast）
+            }
+            lastLowLightAt = now
+            lastActionAt = now
+            actedThisTick = true
+            show("AI：光線不足，拿穩手機")
+        }
+
+        // ---- e) 人像焦段（v0.4.0；自身 ≥20s + 全域 ≥2.5s；僅後鏡）----
+        // 顯示倍率 = 實際 videoZoomFactor / 主鏡(1x) factor（超廣角 virtual
+        // device 下 device factor 2.0 = 顯示 1x）；2x 目標 factor = 2 × 主鏡 factor。
+        // 實際 factor 讀 camera.currentZoomFactor()（鏡像值）— 不可讀
+        // currentLens.zoomFactor：rampZoom 到非焦段 factor（單鏡機 2x、
+        // 三鏡 Pro 2x=4.0 的 tie case）後 currentLens 不變 → 顯示倍率恆讀
+        // 1.0，已在 2x 仍每 20s 重複建議/重 ramp。
+        // 建議模式雖不動參數，仍佔全域閘與 toast slot（檔頭注釋）。
+        if !actedThisTick,
+           !facts.isFrontCamera,
+           isAutoZoomEnabled || isZoomSuggestEnabled,
+           now - lastZoomSuggestAt >= Self.zoomSuggestInterval,
+           now - lastActionAt >= Self.actionInterval,
+           let face = primaryFace(facts),
+           face.box.height >= Self.zoomFaceHeightMin,
+           face.box.height <= Self.zoomFaceHeightMax,
+           facts.subjectDistanceM.map({ $0 > Self.zoomMinSubjectDistanceM }) ?? true,
+           let wideFactor = camera.lensOptions.first(where: { $0.label == "1x" })?.zoomFactor,
+           wideFactor > 0,
+           Double(camera.currentZoomFactor() / wideFactor) < Self.zoomMaxDisplayZoom {
+            let targetFactor = 2.0 * wideFactor
+            lastZoomSuggestAt = now
+            lastActionAt = now
+            actedThisTick = true
+            if isAutoZoomEnabled {
+                // 代操：直接 ramp；還原走 select(lens:)（恢復焦段 + LensBar 高亮
+                // + onCameraReconfigured 通知，語意與手動選鏡一致）。
+                let previousLens = camera.currentLens
+                camera.rampZoom(to: targetFactor, rate: Self.zoomRampRate)
+                undo = { [weak self] in
+                    guard let previousLens else { return }
+                    self?.camera?.select(lens: previousLens)
+                }
+                show("AI：切換 2x（人像壓縮）")
+            } else {
+                // 建議：不動參數，AIAction 帶 apply 閉包（toast 顯示「套用」）。
+                // 按下才 ramp，並轉為可還原 toast；lastZoomSuggestAt 與
+                // lastActionAt 皆以最近 evaluate 的 media 時鐘重置（apply 由
+                // UI 觸發、無 facts 可拿）。lastActionAt 必須一併重置：建議
+                // toast 可停留 8s，用戶按「套用」時距發出建議可能已超過全域閘
+                // 2.5s — 不重置的話下一個 evaluate tick 其他規則（如 c 測光點）
+                // 立刻動作，覆蓋剛轉為可還原的 2x toast 與 undo 閉包，
+                // 用戶剛套用的變焦馬上失去還原路徑。
+                undo = nil
+                show("AI：建議切換 2x（人像壓縮）", apply: { [weak self] in
+                    guard let self, let camera = self.camera else { return }
+                    let previousLens = camera.currentLens
+                    camera.rampZoom(to: targetFactor, rate: Self.zoomRampRate)
+                    self.lastZoomSuggestAt = self.lastEvaluateAt
+                    self.lastActionAt = self.lastEvaluateAt
+                    self.undo = { [weak self] in
+                        guard let previousLens else { return }
+                        self?.camera?.select(lens: previousLens)
+                    }
+                    self.show("AI：切換 2x（人像壓縮）")
+                })
             }
         }
 
@@ -206,12 +357,14 @@ final class AIControlCenter {
         show(text)
     }
 
-    /// 發布動作並排 5s 自動清空（toast 淡出由 latestAction → nil 驅動）。
-    private func show(_ text: String) {
-        latestAction = AIAction(text: text, date: Date())
+    /// 發布動作並排自動清空（toast 淡出由 latestAction → nil 驅動）：
+    /// 已執行動作 5s；建議（帶 apply）8s — 用戶要讀完再決定按「套用」，多給緩衝。
+    private func show(_ text: String, apply: (() -> Void)? = nil) {
+        latestAction = AIAction(text: text, date: Date(), apply: apply)
         clearTask?.cancel()
+        let duration: Double = apply == nil ? 5 : 8
         clearTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(5))
+            try? await Task.sleep(for: .seconds(duration))
             guard !Task.isCancelled else { return }
             self?.latestAction = nil
         }
