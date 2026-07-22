@@ -50,6 +50,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", default="auto", help="auto / cuda / cpu")
     p.add_argument("--workers", type=int, default=2, help="DataLoader workers")
+    p.add_argument("--freeze-backbone", action="store_true",
+                   help="v5：凍結 backbone 只訓 heads（封死 v4 的按圖記憶路徑）")
+    p.add_argument("--cross-pair-w", type=float, default=0.5,
+                   help="v5：批內跨圖配對 loss 權重（0 = 關閉）")
     return p.parse_args()
 
 
@@ -112,17 +116,20 @@ def main() -> None:
         num_workers=args.workers, pin_memory=use_amp,
     )
 
-    model = ReframeNet(pretrained=True).to(device)
-    # v4：backbone 低速微調、heads 全速；weight_decay 拉到 0.01 抗過擬合。
-    optimizer = torch.optim.AdamW(
-        [
+    model = ReframeNet(pretrained=True, freeze_backbone=args.freeze_backbone).to(device)
+    # v4：backbone 低速微調、heads 全速；weight_decay 0.01 抗過擬合。
+    # v5：--freeze-backbone 時 backbone 完全不進 optimizer。
+    head_params = (list(model.trunk.parameters())
+                   + list(model.head_score.parameters())
+                   + list(model.head_delta.parameters()))
+    if args.freeze_backbone:
+        param_groups = [{"params": head_params, "lr": args.lr}]
+    else:
+        param_groups = [
             {"params": model.features.parameters(), "lr": args.lr * 0.1},
-            {"params": list(model.trunk.parameters())
-                       + list(model.head_score.parameters())
-                       + list(model.head_delta.parameters()), "lr": args.lr},
-        ],
-        weight_decay=0.01,
-    )
+            {"params": head_params, "lr": args.lr},
+        ]
+    optimizer = torch.optim.AdamW(param_groups, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     smooth_l1 = nn.SmoothL1Loss()
     # v4：delta 各維以標籤上限正規化（docstring 損失定義）。
@@ -151,6 +158,8 @@ def main() -> None:
         dataset.set_epoch(epoch)
         dataset.augment = True
         model.train()
+        if args.freeze_backbone:
+            model.features.eval()  # 凍結時 BN running stats 也不准動（見 model.py）
         t0 = time.time()
         loss_sum = 0.0
         n_seen = 0
@@ -169,6 +178,12 @@ def main() -> None:
                     + 1.0 * smooth_l1(d_neg / delta_norm, dneg_gt / delta_norm)
                     + 0.3 * smooth_l1(d_pos / delta_norm, dpos_gt / delta_norm)
                 )
+                # v5 批內跨圖配對：A 圖的好取景也要贏過 B 圖的爛裁切。
+                # 按圖記憶對這個排序毫無幫助 → 逼模型學通用構圖分。
+                # roll(1) 讓每張 pos 對上「上一張圖」的 neg（batch≥2 才有意義）。
+                if args.cross_pair_w > 0 and s_pos.size(0) > 1:
+                    loss = loss + args.cross_pair_w * torch.nn.functional.softplus(
+                        -(s_pos - s_neg.roll(1, dims=0))).mean()
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()

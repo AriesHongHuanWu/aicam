@@ -22,10 +22,19 @@ FEATURE_DIM = 576  # mobilenet_v3_small.features 輸出通道數
 
 
 class ReframeNet(nn.Module):
-    def __init__(self, pretrained: bool = True):
+    def __init__(self, pretrained: bool = True, freeze_backbone: bool = False):
+        """freeze_backbone=True（v5）：features 全凍結（requires_grad=False）。
+        動機：v4 實測 train_acc 0.99/val 0.55 = 模型用 backbone 容量「背每張
+        訓練圖的版面」而非學通用構圖；凍結後只剩小 head 可訓練，記憶路徑
+        被封死。注意：凍結時 train.py 必須每個 epoch 在 model.train() 後補
+        model.features.eval()，否則 BatchNorm running stats 仍會被訓練資料
+        污染（見 train.py）。"""
         super().__init__()
         weights = MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None
         self.features = mobilenet_v3_small(weights=weights).features
+        self.frozen_backbone = bool(freeze_backbone)
+        if self.frozen_backbone:
+            self.features.requires_grad_(False)
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.trunk = nn.Sequential(
             nn.Linear(FEATURE_DIM, 256),

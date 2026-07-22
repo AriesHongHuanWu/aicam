@@ -44,9 +44,11 @@ run([
     sys.executable, "Training/train.py",
     "--data", "Training/data/images",
     "--out", "/kaggle/working/checkpoints",
-    "--epochs", "14",
+    "--epochs", "12",
     "--batch", "96",
     "--workers", "4",
+    "--freeze-backbone",
+    "--cross-pair-w", "0.5",
 ])
 run([
     sys.executable, "Training/eval.py",
