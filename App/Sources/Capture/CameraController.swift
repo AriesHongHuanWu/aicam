@@ -31,6 +31,11 @@ final class CameraController {
     /// 拍照成功後回傳 ~1280px JPEG data（教練 / 導演層用）。
     var onPhotoCaptured: ((Data) -> Void)?
 
+    /// 相機重配完成（前後鏡切換／鏡位切換 = 取景座標整體跳變）後通知。
+    /// CoachSession 據此重置導引管線（planner / One-Euro / tracker / stabilizer），
+    /// 舊座標不得帶進新畫面（A5 設定；MainActor 上呼叫）。
+    var onCameraReconfigured: (() -> Void)?
+
     private let service: CaptureSessionService
 
     init() {
@@ -76,8 +81,13 @@ final class CameraController {
 
     func select(lens: LensOption) {
         guard status == .running, lensOptions.contains(lens) else { return }
+        let changed = lens != currentLens
         currentLens = lens
         service.setZoom(factor: lens.zoomFactor, ramped: true)
+        // 焦段真的變了才通知（重按同一顆鏡頭不清教練導引狀態）
+        if changed {
+            onCameraReconfigured?()
+        }
     }
 
     /// 前後鏡切換：重配 input 並重算焦段表。失敗時嘗試回復原鏡位。
@@ -88,6 +98,8 @@ final class CameraController {
         guard let options = await service.configureAndStart(front: targetFront) else {
             if let restored = await service.configureAndStart(front: isFront) {
                 applyLensOptions(restored)
+                // 回復原鏡也重配過 session（帧序中斷）→ 一樣通知教練層重置
+                onCameraReconfigured?()
             } else {
                 status = .failed
             }
@@ -95,6 +107,7 @@ final class CameraController {
         }
         isFront = targetFront
         applyLensOptions(options)
+        onCameraReconfigured?()
     }
 
     // MARK: - 拍照

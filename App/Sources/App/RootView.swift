@@ -5,6 +5,11 @@
 //  - CameraController / LensOption / PreviewSource / PreviewLayerView（A2，Capture）
 //  - CoachSession（A2，Coach）；CoachOverlayView（A3，Coach）
 //  - DirectorCenter / DirectorTipBanner / SettingsView（A4，Director）
+//
+//  本輪 UI 高級化：
+//  - 快門擊發全螢幕白閃（70ms opacity 疊層，haptic 由 ShutterButton 觸發不重複）。
+//  - 取景器頂/底黑漸層改細膩（0.35→0）。
+//  - 權限提示頁重排（icon + 標題 + 說明 + 按鈕，置中優雅）。
 
 import AICamCore
 import SwiftUI
@@ -19,6 +24,8 @@ struct RootView: View {
     @AppStorage("mode") private var mode: CaptureMode = .photo
     @AppStorage("director.live") private var directorLive = false
     @State private var isSettingsPresented = false
+    /// 快門擊發白閃疊層透明度。
+    @State private var shutterFlashOpacity: Double = 0
 
     var body: some View {
         ZStack {
@@ -36,6 +43,19 @@ struct RootView: View {
             }
             .ignoresSafeArea()
 
+            // 頂部細膩黑漸層（狀態列可讀性；不擋操作）。
+            VStack(spacing: 0) {
+                LinearGradient(
+                    colors: [Color.black.opacity(0.35), Color.black.opacity(0)],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+                .frame(height: 130)
+                Spacer(minLength: 0)
+            }
+            .ignoresSafeArea()
+            .allowsHitTesting(false)
+
             VStack(spacing: 0) {
                 StatusStrip { isSettingsPresented = true }
                     .padding(.horizontal, 16)
@@ -47,6 +67,7 @@ struct RootView: View {
                         .font(Tokens.label(12, weight: .medium))
                         .foregroundStyle(Tokens.fg.opacity(0.3))
                         .padding(.top, 12)
+                        .transition(.opacity)
                 }
 
                 Spacer()
@@ -64,6 +85,12 @@ struct RootView: View {
 
                 controls
             }
+
+            // 快門白閃疊層（最上層、不擋觸控）。
+            Color.white
+                .ignoresSafeArea()
+                .opacity(shutterFlashOpacity)
+                .allowsHitTesting(false)
 
             if camera.status == .denied {
                 deniedOverlay
@@ -107,6 +134,7 @@ struct RootView: View {
                 }
                 Spacer()
                 ShutterButton(score: coachScore) {
+                    triggerShutterFlash()
                     Task { await camera.capturePhoto() }
                 }
                 .opacity(camera.isCapturing ? 0.4 : 1)
@@ -124,7 +152,7 @@ struct RootView: View {
         .padding(.bottom, 8)
         .background(
             LinearGradient(
-                colors: [Color.black.opacity(0), Color.black.opacity(0.55)],
+                colors: [Color.black.opacity(0), Color.black.opacity(0.35)],
                 startPoint: .top,
                 endPoint: .bottom
             )
@@ -132,35 +160,57 @@ struct RootView: View {
         )
     }
 
+    // MARK: - 快門白閃
+
+    /// 擊發瞬間全螢幕白閃：立即亮起 → 停留 ~70ms → 快速淡出。
+    /// haptic 已由 ShutterButton 觸發，這裡不重複。
+    private func triggerShutterFlash() {
+        shutterFlashOpacity = 0.9
+        withAnimation(.easeOut(duration: 0.2).delay(0.07)) {
+            shutterFlashOpacity = 0
+        }
+    }
+
     // MARK: - 權限未開啟
 
     private var deniedOverlay: some View {
         ZStack {
             Tokens.bg.ignoresSafeArea()
-            VStack(spacing: 16) {
-                Text("相機權限未開啟")
-                    .font(Tokens.label(17, weight: .semibold))
+            VStack(spacing: 0) {
+                Image(systemName: "camera")
+                    .font(.system(size: 42, weight: .light))
                     .foregroundStyle(Tokens.fg)
-                Text("請在設定中允許 AICam 使用相機")
-                    .font(Tokens.label(13))
+                    .frame(width: 96, height: 96)
+                    .background(Circle().fill(Color(white: 0.08)))
+                    .overlay(Circle().strokeBorder(Tokens.glassHairline, lineWidth: Tokens.hairline))
+                    .padding(.bottom, 28)
+
+                Text("相機權限未開啟")
+                    .font(Tokens.label(20, weight: .semibold))
+                    .foregroundStyle(Tokens.fg)
+
+                Text("AICam 需要相機權限才能擔任你的攝影教練。\n請在「設定」中允許相機存取。")
+                    .font(Tokens.label(14))
                     .foregroundStyle(Tokens.gray2)
+                    .multilineTextAlignment(.center)
+                    .lineSpacing(4)
+                    .padding(.top, 10)
+                    .padding(.horizontal, 40)
+
                 Button {
                     if let url = URL(string: UIApplication.openSettingsURLString) {
                         UIApplication.shared.open(url)
                     }
                 } label: {
                     Text("前往設定")
-                        .font(Tokens.label(15, weight: .medium))
+                        .font(Tokens.label(15, weight: .semibold))
                         .foregroundStyle(Tokens.bg)
-                        .padding(.horizontal, 24)
-                        .padding(.vertical, 10)
-                        .background(
-                            RoundedRectangle(cornerRadius: Tokens.cornerRadius, style: .continuous)
-                                .fill(Tokens.fg)
-                        )
+                        .padding(.horizontal, 28)
+                        .padding(.vertical, 12)
+                        .background(Capsule().fill(Tokens.fg))
                 }
                 .buttonStyle(DSPressScaleButtonStyle())
-                .padding(.top, 8)
+                .padding(.top, 28)
             }
         }
     }

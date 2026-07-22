@@ -5,10 +5,14 @@
 //  Vision request 物件與快取（lastJoints / saliency）皆為該 queue 專屬，不需鎖。
 //  CoreMotion 回呼在 motionQueue 寫入 latestGravity（stateLock 保護），分析時讀最新值。
 //
-//  節奏（~10fps 一次 analyze）：
+//  節奏（~15fps 一次 analyze；提速輪 0.1s → 0.066s）：
 //  - 臉 rectangles + landmarks：每次。
-//  - body pose：每 2 次一次，其餘沿用上次結果；熱降級停用時清空（不留舊關節誤判切邊）。
-//  - saliency（無臉時的主體 fallback）：每 ~1s 一次，結果 2.5s 內有效。
+//  - body pose：每 3 次一次（~5fps），其餘沿用上次結果；熱降級停用時清空
+//    （不留舊關節誤判切邊）。
+//  - saliency（無臉時的主體 fallback）：只在「無臉持續 > 1s」後才啟動，
+//    之後每 ~1s 一次，結果 2.5s 內有效 — 有人臉的正常拍攝路徑完全不付 saliency 成本。
+//  - VNDetectFaceCaptureQualityRequest：本檔「沒有」執行（FaceFact.captureQuality
+//    恆為 nil，屬 P4 篩選範疇），即時管線不付這筆成本。
 //
 //  座標鐵律：
 //  - Vision 輸出 normalized、原點左下、y 向上 → 一律經 VisionCoordinateMapping 轉
@@ -43,12 +47,29 @@ final class FrameAnalyzer {
     private var lastSaliencyBox: NRect?
     private var lastSaliencyRunAt: Double = -.greatestFiniteMagnitude
     private var lastSaliencyHitAt: Double = -.greatestFiniteMagnitude
+    /// 「無臉」狀態的起始時間（media timestamp）；有臉即清空。
+    /// saliency 只在無臉持續 > 1s 後才跑（見檔頭節奏注釋）。
+    private var noFaceSince: Double?
+    /// 上一帧的前後鏡標記：變化 = 座標空間鏡像跳變 → 就地清跨帧快取
+    /// （與 scheduleReset 雙保險，不依賴通知時序）。
+    private var lastIsFront: Bool?
 
     // MARK: - 跨執行緒狀態（stateLock 保護）
 
     private let stateLock = NSLock()
     private var latestGravity: CMAcceleration?
     private var bodyPoseEnabled = true
+    private var resetPending = false
+
+    /// 任意執行緒可呼叫（CoachSession 的重置路徑：切鏡/翻鏡/教練模式重啟）。
+    /// 實際清快取延到下一次 analyze（analysisQueue 上）執行 — 否則 pose 每 3 次
+    /// 才跑一次，重置後最多 2 次分析（~0.13s）會沿用上一個鏡頭座標空間的舊關節，
+    /// makeSubjectBox 可能產出錯位主體框餵進剛重置乾淨的導引管線。
+    func scheduleReset() {
+        stateLock.lock()
+        resetPending = true
+        stateLock.unlock()
+    }
 
     // MARK: - CoreMotion
 
@@ -89,14 +110,25 @@ final class FrameAnalyzer {
     // MARK: - 主流程（只在 analysisQueue 呼叫）
 
     func analyze(pixelBuffer: CVPixelBuffer, timestamp: Double, isFront: Bool) -> FrameFacts {
-        analysisCount += 1
         let bufferWidth = CVPixelBufferGetWidth(pixelBuffer)
         let bufferHeight = CVPixelBufferGetHeight(pixelBuffer)
 
         stateLock.lock()
         let poseEnabled = bodyPoseEnabled
         let gravity = latestGravity
+        let doReset = resetPending
+        resetPending = false
         stateLock.unlock()
+
+        // 排程重置（切鏡/翻鏡/重啟）或前後鏡標記變化 → 先清跨帧快取，
+        // 不讓上一個鏡頭座標空間的關節/saliency 餵進本帧。
+        if doReset || (lastIsFront != nil && lastIsFront != isFront) {
+            clearFrameCaches()
+        }
+        lastIsFront = isFront
+        // 快取清空後 analysisCount 從 0 起 → 本帧 analysisCount == 1 → 立即重跑
+        // body pose（不留舊關節空窗）。
+        analysisCount += 1
 
         // 防線：整條座標鏈假設 connection 已把 buffer 轉直立 portrait
         // （videoRotationAngle=90）。若某機型/組態不支援 90°（CameraController 是
@@ -116,15 +148,28 @@ final class FrameAnalyzer {
         // buffer 已直立（connection 轉 90°）→ orientation 一律 .up
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
         var requests: [VNRequest] = [faceRectanglesRequest, faceLandmarksRequest]
-        let runBodyPose = poseEnabled && analysisCount % 2 == 1
+        // 每 3 次分析跑一次 body pose（15fps 分析 → pose ~5fps；關節相對臉移動慢，夠用）
+        let runBodyPose = poseEnabled && analysisCount % 3 == 1
         if runBodyPose {
             requests.append(bodyPoseRequest)
         }
-        try? handler.perform(requests)
+        // perform 失敗（buffer 格式異常/資源壓力）時，重用的 request 物件的 .results
+        // 仍保留「上一次成功帧」的觀測 — 不得當成本帧結果（座標可能已過時）。
+        // 失敗 = 本帧無視覺觀測，與檔頭「橫向 buffer 誠實回退」同一原則。
+        var visionOK = true
+        do {
+            try handler.perform(requests)
+        } catch {
+            visionOK = false
+        }
 
         // compactMap-cast 寫法同時相容「typed results」與「[VNObservation]」兩種 SDK 型別
-        let rectFaces = (faceRectanglesRequest.results ?? []).compactMap { $0 as? VNFaceObservation }
-        let landmarkFaces = (faceLandmarksRequest.results ?? []).compactMap { $0 as? VNFaceObservation }
+        let rectFaces = visionOK
+            ? (faceRectanglesRequest.results ?? []).compactMap { $0 as? VNFaceObservation }
+            : []
+        let landmarkFaces = visionOK
+            ? (faceLandmarksRequest.results ?? []).compactMap { $0 as? VNFaceObservation }
+            : []
         // landmarks 請求的觀測自帶 bbox；完全沒有時退回 rectangles 結果
         let sourceFaces = landmarkFaces.isEmpty ? rectFaces : landmarkFaces
         let topFaces = sourceFaces
@@ -150,9 +195,10 @@ final class FrameAnalyzer {
             faces.append(fact)
         }
 
-        // Body pose：每 2 次一次，其餘沿用；停用時清空快取
+        // Body pose：每 3 次一次，其餘沿用；停用時清空快取。
+        // perform 失敗帧不讀過期 results — 沿用快取（同非 pose 帧語意）。
         var joints = lastJoints
-        if runBodyPose {
+        if runBodyPose, visionOK {
             joints = extractJoints()
             lastJoints = joints
         } else if !poseEnabled {
@@ -160,23 +206,37 @@ final class FrameAnalyzer {
             lastJoints = []
         }
 
-        // Saliency：無臉時每 ~1s 跑一次，取第一個 salient object 當主體 fallback
-        if faces.isEmpty, timestamp - lastSaliencyRunAt >= 1.0 {
-            lastSaliencyRunAt = timestamp
-            try? handler.perform([saliencyRequest])
-            let salient = (saliencyRequest.results ?? [])
-                .compactMap { $0 as? VNSaliencyImageObservation }
-                .first?.salientObjects?.first
-            if let salient {
-                let bb = salient.boundingBox
-                lastSaliencyBox = VisionCoordinateMapping.toNormalizedFrame(
-                    visionRect: Double(bb.origin.x),
-                    y: Double(bb.origin.y),
-                    width: Double(bb.size.width),
-                    height: Double(bb.size.height)
-                )
-                lastSaliencyHitAt = timestamp
+        // Saliency：無臉「持續 > 1s」才啟動（短暫掉臉不觸發），之後每 ~1s 跑一次，
+        // 取第一個 salient object 當主體 fallback
+        if faces.isEmpty {
+            if noFaceSince == nil {
+                noFaceSince = timestamp
             }
+        } else {
+            noFaceSince = nil
+        }
+        if faces.isEmpty,
+           let since = noFaceSince, timestamp - since > 1.0,
+           timestamp - lastSaliencyRunAt >= 1.0 {
+            lastSaliencyRunAt = timestamp
+            // perform 失敗 = 本帧無 saliency 觀測；不讀重用 request 的過期 results
+            //（既有快取由 2.5s 時效自然淘汰）。
+            do {
+                try handler.perform([saliencyRequest])
+                let salient = (saliencyRequest.results ?? [])
+                    .compactMap { $0 as? VNSaliencyImageObservation }
+                    .first?.salientObjects?.first
+                if let salient {
+                    let bb = salient.boundingBox
+                    lastSaliencyBox = VisionCoordinateMapping.toNormalizedFrame(
+                        visionRect: Double(bb.origin.x),
+                        y: Double(bb.origin.y),
+                        width: Double(bb.size.width),
+                        height: Double(bb.size.height)
+                    )
+                    lastSaliencyHitAt = timestamp
+                }
+            } catch {}
         }
 
         let subjectBox = makeSubjectBox(faces: faces, joints: joints, timestamp: timestamp)
@@ -195,6 +255,17 @@ final class FrameAnalyzer {
             isFrontCamera: isFront,
             timestamp: timestamp
         )
+    }
+
+    /// 清跨帧快取（只在 analysisQueue 上呼叫）。analysisCount 歸零 →
+    /// 下一帧 analysisCount % 3 == 1 立即重跑 body pose。
+    private func clearFrameCaches() {
+        analysisCount = 0
+        lastJoints = []
+        lastSaliencyBox = nil
+        lastSaliencyRunAt = -.greatestFiniteMagnitude
+        lastSaliencyHitAt = -.greatestFiniteMagnitude
+        noFaceSince = nil
     }
 
     // MARK: - 臉

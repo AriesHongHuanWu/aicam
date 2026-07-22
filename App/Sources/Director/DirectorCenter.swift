@@ -9,6 +9,7 @@
 
 import Foundation
 import Observation
+import os
 
 /// 導演給的一句建議（跨模組契約型別）。
 struct DirectorTip: Equatable {
@@ -56,6 +57,9 @@ final class DirectorCenter {
     @ObservationIgnored private var clearTask: Task<Void, Never>?
     @ObservationIgnored private var liveTask: Task<Void, Never>?
 
+    /// 真機除錯用：每次請求記下實際使用的模型名（let 不受 @Observable 追蹤）。
+    private let logger = Logger(subsystem: "com.arieswu.aicam", category: "DirectorCenter")
+
     private init() {}
 
     /// 拍照成功後呼叫（~1280px JPEG）。
@@ -67,9 +71,11 @@ final class DirectorCenter {
         guard now.timeIntervalSince(lastRequestAt) >= 8 else { return }
         lastRequestAt = now
 
+        let model = GeminiDirectorService.shared.resolvedModel(for: .postCapture)
+        logger.debug("director request: source=postCapture model=\(model, privacy: .public)")
         Task { [weak self] in
             guard let tip = await GeminiDirectorService.shared.tip(
-                jpeg: jpeg, context: nil, source: .postCapture
+                jpeg: jpeg, context: nil, source: .postCapture, model: model
             ) else { return }
             self?.show(tip)
         }
@@ -124,8 +130,10 @@ final class DirectorCenter {
         guard let jpeg = await snapshot() else { return }
         lastRequestAt = now
 
+        let model = GeminiDirectorService.shared.resolvedModel(for: .live)
+        logger.debug("director request: source=live model=\(model, privacy: .public)")
         guard let tip = await GeminiDirectorService.shared.tip(
-            jpeg: jpeg, context: context(), source: .live
+            jpeg: jpeg, context: context(), source: .live, model: model
         ) else { return }
         // stopLive 後回來的結果不再顯示。
         guard !Task.isCancelled else { return }

@@ -1,11 +1,16 @@
 //  SettingsView.swift
-//  AICam — 設定頁（跨模組契約，A4 擁有；RootView 以 sheet 呈現）。
+//  AICam — 設定頁（跨模組契約，A4 擁有；本輪 A3 依契約重排 + 實作模型選擇 UI）。
 //
-//  區塊：AI 導演（開關 / Gemini API Key / 模型 / 測試連線）、
+//  區塊：AI 導演（開關 / Gemini API Key / 模型選擇 / 測試連線）、
 //        教練（自動抓拍 / 導演即時建議，P2）、
 //        拍攝（網格線 P0 佔位）、關於（版本）。
+//  模型選擇（跨模組契約）：
+//  - director.modelMode："auto"（推薦，預設）| "custom"
+//  - auto：即時導演走 gemini-flash-lite-latest（低延遲）、拍後走 gemini-flash-latest（品質）
+//    （官方別名，永遠指向最新 flash / flash-lite 版本；A4 讀 keys，此處只讀寫）。
+//  - custom：director.model.live / director.model.post 兩欄自訂。
 //  API Key 只存本機 Keychain（"gemini-api-key"），不進 UserDefaults；
-//  全部繁體中文、§9 黑白 tokens（無彩色 accent）。
+//  全部繁體中文、§9 黑白 tokens（無彩色 accent，層次靠灰階 icon 磚 + Section 呼吸）。
 
 import SwiftUI
 
@@ -17,7 +22,12 @@ struct SettingsView: View {
     // MARK: - 持久化設定
 
     @AppStorage("director.enabled") private var directorEnabled = false
-    @AppStorage("director.model") private var directorModel = "gemini-2.5-flash"
+    /// 模型選擇模式："auto"（推薦）| "custom"（跨模組契約 key）。
+    @AppStorage("director.modelMode") private var directorModelMode = "auto"
+    /// 自訂時的即時導演模型（低延遲場景）。
+    @AppStorage("director.model.live") private var directorModelLive = "gemini-flash-lite-latest"
+    /// 自訂時的拍後建議模型（品質場景）。
+    @AppStorage("director.model.post") private var directorModelPost = "gemini-flash-latest"
     @AppStorage("director.live") private var directorLive = false
     @AppStorage("coach.autoCapture") private var coachAutoCapture = false
     @AppStorage("grid.enabled") private var gridEnabled = false
@@ -26,6 +36,9 @@ struct SettingsView: View {
 
     @State private var apiKey = ""
     @State private var hasLoadedKey = false
+    /// Keychain 目前已持久化的值（trim 後）。persistAPIKey 據此跳過相同值 —
+    /// 不做逐鍵 Keychain round-trip，也不把打到一半的 key 片段持久化。
+    @State private var savedKey = ""
     @State private var connectionTest: ConnectionTestState = .idle
 
     private enum ConnectionTestState: Equatable {
@@ -38,6 +51,8 @@ struct SettingsView: View {
     private static let keychainKey = "gemini-api-key"
     /// Form 列底色（深灰階，維持純黑白 UI）。
     private static let rowBackground = Color(white: 0.09)
+    /// icon 磚底色。
+    private static let iconTileBackground = Color(white: 0.17)
 
     // MARK: - Body
 
@@ -51,12 +66,17 @@ struct SettingsView: View {
             }
             .scrollContentBackground(.hidden)
             .background(Tokens.bg.ignoresSafeArea())
+            .animation(Tokens.springAppear, value: directorModelMode)
             .navigationTitle("設定")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button("完成") { dismiss() }
-                        .foregroundStyle(Tokens.fg)
+                    Button("完成") {
+                        persistAPIKey()
+                        dismiss()
+                    }
+                    .font(Tokens.label(15, weight: .semibold))
+                    .foregroundStyle(Tokens.fg)
                 }
             }
         }
@@ -65,7 +85,13 @@ struct SettingsView: View {
         .onAppear {
             guard !hasLoadedKey else { return }
             hasLoadedKey = true
-            apiKey = KeychainStore.get(forKey: Self.keychainKey) ?? ""
+            let stored = KeychainStore.get(forKey: Self.keychainKey) ?? ""
+            savedKey = stored.trimmingCharacters(in: .whitespacesAndNewlines)
+            apiKey = stored
+        }
+        // sheet 下滑關閉等未經「完成」的離開路徑也要落盤。
+        .onDisappear {
+            persistAPIKey()
         }
     }
 
@@ -73,67 +99,80 @@ struct SettingsView: View {
 
     private var directorSection: some View {
         Section {
-            Toggle("導演建議", isOn: $directorEnabled)
-                .tint(Tokens.gray2)
-
-            SecureField("Gemini API Key", text: $apiKey)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .keyboardType(.asciiCapable)
-                .foregroundStyle(Tokens.gray1)
-                .onChange(of: apiKey) { _, newValue in
-                    let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if trimmed.isEmpty {
-                        KeychainStore.delete(forKey: Self.keychainKey)
-                    } else {
-                        KeychainStore.set(trimmed, forKey: Self.keychainKey)
-                    }
-                    if connectionTest != .testing {
-                        connectionTest = .idle
-                    }
-                }
+            Toggle(isOn: $directorEnabled) {
+                settingLabel("導演建議", icon: "wand.and.stars")
+            }
+            .tint(Tokens.gray2)
 
             HStack(spacing: 12) {
-                Text("模型")
-                TextField("gemini-2.5-flash", text: $directorModel)
-                    .multilineTextAlignment(.trailing)
+                iconTile("key")
+                SecureField("Gemini API Key", text: $apiKey)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                     .keyboardType(.asciiCapable)
                     .foregroundStyle(Tokens.gray1)
+                    // 逐鍵只清測試狀態；Keychain 寫入延到 onSubmit / 測試連線前 /
+                    // 離開頁面（persistAPIKey）一次落盤 — 不做逐鍵 Keychain I/O。
+                    .onChange(of: apiKey) { _, _ in
+                        if connectionTest != .testing {
+                            connectionTest = .idle
+                        }
+                    }
+                    .onSubmit {
+                        persistAPIKey()
+                    }
+            }
+
+            VStack(alignment: .leading, spacing: 12) {
+                settingLabel("模型", icon: "cpu")
+                Picker("模型選擇", selection: $directorModelMode) {
+                    Text("自動（推薦）").tag("auto")
+                    Text("自訂").tag("custom")
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+            }
+            .padding(.vertical, 2)
+
+            if directorModelMode == "custom" {
+                HStack(spacing: 12) {
+                    Text("即時模型")
+                        .foregroundStyle(Tokens.fg)
+                    TextField("gemini-flash-lite-latest", text: $directorModelLive)
+                        .multilineTextAlignment(.trailing)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .keyboardType(.asciiCapable)
+                        .font(Tokens.mono(14))
+                        .foregroundStyle(Tokens.gray1)
+                }
+                HStack(spacing: 12) {
+                    Text("拍後模型")
+                        .foregroundStyle(Tokens.fg)
+                    TextField("gemini-flash-latest", text: $directorModelPost)
+                        .multilineTextAlignment(.trailing)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .keyboardType(.asciiCapable)
+                        .font(Tokens.mono(14))
+                        .foregroundStyle(Tokens.gray1)
+                }
             }
 
             Button {
                 runConnectionTest()
             } label: {
                 HStack(spacing: 12) {
-                    Text("測試連線")
-                        .foregroundStyle(Tokens.fg)
+                    settingLabel("測試連線", icon: "antenna.radiowaves.left.and.right")
                     Spacer(minLength: 8)
-                    switch connectionTest {
-                    case .idle:
-                        EmptyView()
-                    case .testing:
-                        ProgressView()
-                            .tint(Tokens.gray2)
-                    case .success:
-                        Text("✓ 連線成功")
-                            .font(Tokens.label(13))
-                            .foregroundStyle(Tokens.fg)
-                    case .failure(let reason):
-                        Text("✗ \(reason)")
-                            .font(Tokens.label(13))
-                            .foregroundStyle(Tokens.gray2)
-                            .lineLimit(2)
-                            .multilineTextAlignment(.trailing)
-                    }
+                    connectionTestStatus
                 }
             }
             .disabled(connectionTest == .testing)
         } header: {
             sectionHeader("AI 導演")
         } footer: {
-            Text("拍照後由 Gemini 給一句下一步建議；API Key 只儲存在本機 Keychain。")
+            Text("拍照後由 Gemini 給一句下一步建議；API Key 只儲存在本機 Keychain。自動模式：即時建議走 flash-lite（低延遲）、拍後建議走 flash（品質），永遠指向 Google 最新版本。")
                 .font(Tokens.label(12))
                 .foregroundStyle(Tokens.gray2)
         }
@@ -141,31 +180,77 @@ struct SettingsView: View {
         .listRowSeparatorTint(Tokens.hairlineColor)
     }
 
+    /// 測試連線右側狀態（轉圈 / 結果 pop）。
+    @ViewBuilder
+    private var connectionTestStatus: some View {
+        ZStack {
+            switch connectionTest {
+            case .idle:
+                EmptyView()
+            case .testing:
+                ProgressView()
+                    .tint(Tokens.gray2)
+                    .transition(.opacity)
+            case .success:
+                HStack(spacing: 5) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 13, weight: .semibold))
+                    Text("連線成功")
+                        .font(Tokens.label(13, weight: .medium))
+                }
+                .foregroundStyle(Tokens.fg)
+                .transition(.scale(scale: 0.8).combined(with: .opacity))
+            case .failure(let reason):
+                HStack(spacing: 5) {
+                    Image(systemName: "xmark.circle")
+                        .font(.system(size: 13, weight: .semibold))
+                    Text(reason)
+                        .font(Tokens.label(13))
+                        .lineLimit(2)
+                        .multilineTextAlignment(.trailing)
+                }
+                .foregroundStyle(Tokens.gray2)
+                .transition(.scale(scale: 0.8).combined(with: .opacity))
+            }
+        }
+        .animation(Tokens.springAppear, value: connectionTest)
+    }
+
     // MARK: - 教練
 
     private var coachSection: some View {
         Section {
             Toggle(isOn: $coachAutoCapture) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("自動抓拍")
-                    Text("對齊鎖定且表情到位時自動拍攝")
-                        .font(Tokens.label(12))
-                        .foregroundStyle(Tokens.gray2)
+                HStack(spacing: 12) {
+                    iconTile("camera.viewfinder")
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("自動抓拍")
+                        Text("對齊鎖定且表情到位時自動拍攝")
+                            .font(Tokens.label(12))
+                            .foregroundStyle(Tokens.gray2)
+                    }
                 }
             }
             .tint(Tokens.gray2)
 
             Toggle(isOn: $directorLive) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("導演即時建議")
-                    Text("教練模式下每 10 秒給一句現場建議（需 API Key）")
-                        .font(Tokens.label(12))
-                        .foregroundStyle(Tokens.gray2)
+                HStack(spacing: 12) {
+                    iconTile("bubble.left.and.bubble.right")
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("導演即時建議")
+                        Text("教練模式下每 10 秒給一句現場建議（需 API Key）")
+                            .font(Tokens.label(12))
+                            .foregroundStyle(Tokens.gray2)
+                    }
                 }
             }
             .tint(Tokens.gray2)
         } header: {
             sectionHeader("教練")
+        } footer: {
+            Text("教練模式的目標環與分數環永遠在本機即時計算，不需網路。")
+                .font(Tokens.label(12))
+                .foregroundStyle(Tokens.gray2)
         }
         .listRowBackground(Self.rowBackground)
         .listRowSeparatorTint(Tokens.hairlineColor)
@@ -175,8 +260,10 @@ struct SettingsView: View {
 
     private var captureSection: some View {
         Section {
-            Toggle("網格線", isOn: $gridEnabled)
-                .tint(Tokens.gray2)
+            Toggle(isOn: $gridEnabled) {
+                settingLabel("網格線", icon: "grid")
+            }
+            .tint(Tokens.gray2)
         } header: {
             sectionHeader("拍攝")
         } footer: {
@@ -192,7 +279,8 @@ struct SettingsView: View {
 
     private var aboutSection: some View {
         Section {
-            HStack {
+            HStack(spacing: 12) {
+                iconTile("info")
                 Text("版本")
                 Spacer()
                 Text(appVersion)
@@ -201,6 +289,10 @@ struct SettingsView: View {
             }
         } header: {
             sectionHeader("關於")
+        } footer: {
+            Text("AICam — AI 攝影教練相機")
+                .font(Tokens.label(12))
+                .foregroundStyle(Tokens.gray2)
         }
         .listRowBackground(Self.rowBackground)
         .listRowSeparatorTint(Tokens.hairlineColor)
@@ -208,7 +300,22 @@ struct SettingsView: View {
 
     // MARK: - 動作與輔助
 
+    /// 把輸入的 API Key 一次寫入 Keychain（trim 後與現值相同則跳過；
+    /// 空值 = 刪除項目）。onSubmit / 測試連線前 / 完成 / 離開頁面時呼叫。
+    private func persistAPIKey() {
+        let trimmed = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed != savedKey else { return }
+        if trimmed.isEmpty {
+            KeychainStore.delete(forKey: Self.keychainKey)
+        } else {
+            KeychainStore.set(trimmed, forKey: Self.keychainKey)
+        }
+        savedKey = trimmed
+    }
+
     private func runConnectionTest() {
+        // healthCheck 從 Keychain 讀 key → 測試前先落盤，否則測到的是舊 key。
+        persistAPIKey()
         connectionTest = .testing
         Task {
             let result = await GeminiDirectorService.shared.healthCheck()
@@ -228,6 +335,27 @@ struct SettingsView: View {
             return description
         }
         return error.localizedDescription
+    }
+
+    /// 灰階 icon 磚（26pt 圓角方塊 + SF Symbol），設定列統一視覺。
+    private func iconTile(_ systemName: String) -> some View {
+        Image(systemName: systemName)
+            .font(.system(size: 13, weight: .medium))
+            .foregroundStyle(Tokens.fg)
+            .frame(width: 26, height: 26)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Self.iconTileBackground)
+            )
+    }
+
+    /// icon 磚 + 標題（設定列標準版型）。
+    private func settingLabel(_ title: String, icon: String) -> some View {
+        HStack(spacing: 12) {
+            iconTile(icon)
+            Text(title)
+                .foregroundStyle(Tokens.fg)
+        }
     }
 
     private func sectionHeader(_ title: String) -> some View {

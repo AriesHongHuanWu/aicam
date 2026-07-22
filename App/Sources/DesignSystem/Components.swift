@@ -1,5 +1,12 @@
 //  Components.swift
 //  AICam — 設計系統共用元件（A3 擁有）。全部走 Tokens 黑白灰階、繁中文案。
+//
+//  本輪 UI 高級化：
+//  - 快門：按壓 0.88 彈簧 + 瞬亮；分數環 trim 以 spring 追分、≥85 白色柔光。
+//  - 鏡頭列：選中 chip 放大 1.08 白底黑字；未選玻璃底白字；morph 彈簧。
+//  - 模式列：選中膠囊玻璃底以 matchedGeometryEffect 滑動；selection haptic。
+//  - 縮圖：新照片以 scale 0.3→1 + offset 彈簧飛入。
+//  - 狀態列 / 翻轉鈕：玻璃材質層次（dsGlass 系列）。
 
 import SwiftUI
 import UIKit
@@ -10,7 +17,19 @@ struct DSPressScaleButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .scaleEffect(configuration.isPressed ? 0.92 : 1)
-            .animation(Tokens.animation, value: configuration.isPressed)
+            .animation(Tokens.springFast, value: configuration.isPressed)
+    }
+}
+
+// MARK: - 快門按壓 style（0.88 彈簧 + 按下瞬亮）
+
+/// 縮放走 springFast；亮度提升放在 animation 之外 → 按下瞬亮、不補間。
+struct DSShutterButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.88 : 1)
+            .animation(Tokens.springFast, value: configuration.isPressed)
+            .brightness(configuration.isPressed ? 0.18 : 0)
     }
 }
 
@@ -18,8 +37,9 @@ struct DSPressScaleButtonStyle: ButtonStyle {
 
 /// 72pt 白色雙圈快門。
 /// `score` 非 nil（教練模式）時外圈變成 0–100 構圖分數進度環：
-/// 背景白 20% 素圈 + 白色 trim 進度（12 點鐘起順時針），分數變化 0.2s 動畫。
-/// `score == nil` 時與 P0 行為完全相同（白色素圈）。
+/// 背景白 20% 素圈 + 白色 trim 進度（12 點鐘起順時針），trim 以 spring 追分數；
+/// 分數 ≥85 時環外緣加白色柔光（radius 8）。
+/// `score == nil` 時為白色素圈。
 struct ShutterButton: View {
     let score: Int?
     let action: () -> Void
@@ -36,15 +56,20 @@ struct ShutterButton: View {
         } label: {
             ZStack {
                 if let score {
+                    let clamped = min(max(score, 0), 100)
                     Circle()
                         .stroke(Tokens.fg.opacity(0.2), lineWidth: 3)
                         .frame(width: 72, height: 72)
                     Circle()
-                        .trim(from: 0, to: CGFloat(min(max(score, 0), 100)) / 100)
+                        .trim(from: 0, to: CGFloat(clamped) / 100)
                         .stroke(Tokens.fg, style: StrokeStyle(lineWidth: 3, lineCap: .round))
                         .rotationEffect(.degrees(-90))
                         .frame(width: 72, height: 72)
-                        .animation(.linear(duration: 0.2), value: score)
+                        .shadow(
+                            color: .white.opacity(clamped >= 85 ? 0.8 : 0),
+                            radius: clamped >= 85 ? 8 : 0
+                        )
+                        .animation(Tokens.springFast, value: clamped)
                 } else {
                     Circle()
                         .stroke(Tokens.fg, lineWidth: 3)
@@ -55,14 +80,14 @@ struct ShutterButton: View {
                     .frame(width: 58, height: 58)
             }
         }
-        .buttonStyle(DSPressScaleButtonStyle())
+        .buttonStyle(DSShutterButtonStyle())
         .accessibilityLabel("快門")
     }
 }
 
 // MARK: - 焦段列
 
-/// 焦段 chips。選中＝白底黑字；未選＝白字髮絲邊框。無鏡頭資料時不佔空間。
+/// 焦段 chips。選中＝白底黑字放大 1.08；未選＝玻璃底白字。無鏡頭資料時不佔空間。
 struct LensBar: View {
     let options: [LensOption]
     let selectedID: String?
@@ -96,32 +121,62 @@ struct LensBar: View {
                 .foregroundStyle(isSelected ? Tokens.bg : Tokens.fg)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 5)
-                .background(
-                    RoundedRectangle(cornerRadius: Tokens.cornerRadius, style: .continuous)
-                        .fill(isSelected ? Tokens.fg : Color.clear)
-                )
+                .background {
+                    if isSelected {
+                        RoundedRectangle(cornerRadius: Tokens.cornerRadius, style: .continuous)
+                            .fill(Tokens.fg)
+                    } else {
+                        RoundedRectangle(cornerRadius: Tokens.cornerRadius, style: .continuous)
+                            .fill(.ultraThinMaterial)
+                            .environment(\.colorScheme, .dark)
+                    }
+                }
                 .overlay(
                     RoundedRectangle(cornerRadius: Tokens.cornerRadius, style: .continuous)
-                        .stroke(isSelected ? Color.clear : Tokens.hairlineColor, lineWidth: Tokens.hairline)
+                        .strokeBorder(
+                            isSelected ? Color.clear : Tokens.glassHairline,
+                            lineWidth: Tokens.hairline
+                        )
                 )
+                .shadow(color: Tokens.softShadow, radius: 8, x: 0, y: 2)
+                .scaleEffect(isSelected ? 1.08 : 1)
         }
         .buttonStyle(.plain)
-        .animation(Tokens.animation, value: isSelected)
+        .animation(Tokens.springFast, value: isSelected)
     }
 }
 
 // MARK: - 模式切換
 
-/// 4 模式橫向文字：選中白、未選 gray2；點擊或左右 swipe 切換。
+/// 4 模式橫向文字：選中白字 + 玻璃膠囊底（matchedGeometryEffect 滑動彈簧）、
+/// 未選 gray2；點擊或左右 swipe 切換，切換觸發 selection haptic。
 struct ModeCarousel: View {
     @Binding var mode: CaptureMode
+    @Namespace private var pillNamespace
 
     var body: some View {
-        HStack(spacing: 28) {
+        HStack(spacing: 10) {
             ForEach(CaptureMode.allCases, id: \.self) { candidate in
+                let isSelected = candidate == mode
                 Text(candidate.displayName)
-                    .font(Tokens.label(13, weight: candidate == mode ? .semibold : .regular))
-                    .foregroundStyle(candidate == mode ? Tokens.fg : Tokens.gray2)
+                    .font(Tokens.label(13, weight: isSelected ? .semibold : .regular))
+                    .foregroundStyle(isSelected ? Tokens.fg : Tokens.gray2)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 6)
+                    .background {
+                        if isSelected {
+                            Capsule()
+                                .fill(.ultraThinMaterial)
+                                .overlay(
+                                    Capsule().strokeBorder(
+                                        Tokens.glassHairline,
+                                        lineWidth: Tokens.hairline
+                                    )
+                                )
+                                .environment(\.colorScheme, .dark)
+                                .matchedGeometryEffect(id: "mode.pill", in: pillNamespace)
+                        }
+                    }
                     .contentShape(Rectangle())
                     .onTapGesture { select(candidate) }
             }
@@ -152,13 +207,13 @@ struct ModeCarousel: View {
     private func select(_ newMode: CaptureMode) {
         guard newMode != mode else { return }
         UISelectionFeedbackGenerator().selectionChanged()
-        withAnimation(Tokens.animation) { mode = newMode }
+        withAnimation(Tokens.springFast) { mode = newMode }
     }
 }
 
 // MARK: - 頂部狀態列
 
-/// 左：格式 chip（P0 固定 HEIF）；右：設定齒輪。
+/// 左：格式 chip（玻璃底）；右：設定齒輪（玻璃圓底）。
 struct StatusStrip: View {
     let formatLabel: String
     let onSettings: () -> Void
@@ -173,21 +228,20 @@ struct StatusStrip: View {
             Text(formatLabel)
                 .font(Tokens.mono(11, weight: .medium))
                 .foregroundStyle(Tokens.gray1)
-                .padding(.horizontal, 8)
+                .padding(.horizontal, 9)
                 .padding(.vertical, 4)
-                .background(
-                    RoundedRectangle(cornerRadius: Tokens.cornerRadius, style: .continuous)
-                        .fill(Tokens.gray3.opacity(0.55))
-                )
+                .dsGlass()
             Spacer()
             Button(action: onSettings) {
                 Image(systemName: "gearshape")
-                    .font(.system(size: 16, weight: .medium))
+                    .font(.system(size: 15, weight: .medium))
                     .foregroundStyle(Tokens.fg)
+                    .frame(width: 36, height: 36)
+                    .dsGlassCircle()
                     .frame(width: 44, height: 44)
                     .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
+            .buttonStyle(DSPressScaleButtonStyle())
             .accessibilityLabel("設定")
         }
     }
@@ -196,9 +250,13 @@ struct StatusStrip: View {
 // MARK: - 相簿縮圖
 
 /// 36pt 圓角縮圖；尚無照片時顯示髮絲空框。
+/// 新照片出現時以彈簧飛入（scale 0.3→1 + 由快門方向 offset 歸位）。
 struct ThumbnailButton: View {
     let image: UIImage?
     let action: () -> Void
+
+    @State private var appearScale: CGFloat = 1
+    @State private var appearOffset: CGSize = .zero
 
     init(image: UIImage?, action: @escaping () -> Void) {
         self.image = image
@@ -219,10 +277,23 @@ struct ThumbnailButton: View {
             .frame(width: 36, height: 36)
             .clipShape(shape)
             .overlay(shape.stroke(Tokens.hairlineColor, lineWidth: Tokens.hairline))
+            .shadow(color: Tokens.softShadow, radius: 8, x: 0, y: 2)
+            .scaleEffect(appearScale)
+            .offset(appearOffset)
             .contentShape(Rectangle())
         }
         .buttonStyle(DSPressScaleButtonStyle())
         .accessibilityLabel("相簿")
+        .onChange(of: image) { _, newValue in
+            guard newValue != nil else { return }
+            // 先無動畫落到起點（縮小、偏向快門方向），再彈簧歸位 = 飛入。
+            appearScale = 0.3
+            appearOffset = CGSize(width: 36, height: 8)
+            withAnimation(Tokens.springAppear) {
+                appearScale = 1
+                appearOffset = .zero
+            }
+        }
     }
 
     private var shape: RoundedRectangle {
@@ -232,8 +303,11 @@ struct ThumbnailButton: View {
 
 // MARK: - 前後鏡切換
 
+/// 玻璃圓底 + 點擊時圖示旋轉 180°。
 struct FlipButton: View {
     let action: () -> Void
+
+    @State private var spinDegrees: Double = 0
 
     init(action: @escaping () -> Void) {
         self.action = action
@@ -242,13 +316,17 @@ struct FlipButton: View {
     var body: some View {
         Button {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            withAnimation(Tokens.springAppear) {
+                spinDegrees += 180
+            }
             action()
         } label: {
             Image(systemName: "arrow.triangle.2.circlepath.camera")
-                .font(.system(size: 17, weight: .medium))
+                .font(.system(size: 16, weight: .medium))
                 .foregroundStyle(Tokens.fg)
+                .rotationEffect(.degrees(spinDegrees))
                 .frame(width: 44, height: 44)
-                .background(Circle().fill(Tokens.gray3.opacity(0.55)))
+                .dsGlassCircle()
         }
         .buttonStyle(DSPressScaleButtonStyle())
         .accessibilityLabel("切換前後鏡頭")

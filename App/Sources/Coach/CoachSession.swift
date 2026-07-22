@@ -1,21 +1,32 @@
 //  CoachSession.swift
 //  AICam — 教練 session 中樞（A5；跨模組契約 surface，UI 讀這裡）。
 //
-//  資料流（MASTER-PLAN §3）：
-//  VideoFrameTap（analysisQueue）→ FrameAnalyzer → FrameFacts
+//  資料流（MASTER-PLAN §3；品質大修輪重接）：
+//  VideoFrameTap（analysisQueue，~15fps）→ FrameAnalyzer → FrameFacts
 //    → CoachPipeline（同 queue：L1 引擎 evaluate → TargetSolver.solve →
-//       GuidanceTracker 鎖定判斷 → anchor/target PointSmoother → AdviceStabilizer → ScoreSmoother）
+//       錨點 OneEuroFilter2D → StickyTargetPlanner 承諾目標（凍結；A1 契約：
+//       平滑錨點先進 planner）→ GuidanceTracker 鎖定判斷 → AdviceStabilizer →
+//       ScoreSmoother）
 //    → Task { @MainActor } 一次發布全部 @Observable 屬性（渲染與分析解耦）。
+//
+//  飄移根治（本輪核心）：
+//  - targetPoint 來自 StickyTargetPlanner「承諾後」的目標 — 對齊期間絕不動、
+//    絕不再對 target 做任何平滑（凍結本身就是最強穩定）。舊版把 target 跟著
+//    主體位置逐帧重算＝「追會跑的靶」，已根治。
+//  - anchorPoint 過 One-Euro 濾波：近靜止強力去抖、快速移動低延遲跟上。
+//  - PointSmoother（Core）App 端不再使用（Core 檔不動）。
 //
 //  - 鎖定（.locked）轉變邊緣觸發一次 UINotificationFeedbackGenerator.success。
 //  - 自動抓拍：coach.autoCapture 開 && result.shouldAutoCapture && lockState == .locked
-//    && 距上次自動拍 ≥ 3s（media timestamp 防抖）→ camera.capturePhoto()。
+//    （承諾目標的鎖定）&& 距上次自動拍 ≥ 3s（media timestamp 防抖）→ camera.capturePhoto()。
 //    （v1 簡化：單張、無 gyro 穩定度／臉部銳利度檢查；MASTER-PLAN §4.7 的
 //    「靜音連拍 3 張進 Session」屬 P4/P5，後續執行者勿誤以為已完成。）
 //  - 熱降級：thermalState ≥ .serious → 分析間隔 0.25s + 停 body pose（thermalReduced 發布）。
+//  - 重置時機：進出教練模式（setActive）、flipCamera 完成、鏡位切換
+//    （camera.onCameraReconfigured）→ planner/One-Euro/tracker/stabilizer 全重置。
 //  - snapshotJPEG(maxDimension:)：最新分析帧同步轉 JPEG（Gemini 導演即時模式取帧用）。
 //
-//  待真機驗證（發布頻率 ~10fps；facts 屬性只有教練 overlay 應讀取，見檔尾註記）。
+//  待真機驗證（發布頻率 ~15fps；facts 屬性只有教練 overlay 應讀取，見檔尾註記）。
 
 import Foundation
 import Observation
@@ -31,12 +42,21 @@ final class CoachSession {
     private(set) var facts: FrameFacts?
     private(set) var result: CompositionResult?
     private(set) var guidance: TargetGuidance?
+    /// One-Euro 平滑後主體錨點（NormalizedFrame）。A3 overlay 畫錨點讀這裡。
+    private(set) var anchorPoint: NPoint?
+    /// StickyTargetPlanner 承諾後的固定目標：對齊期間絕不動（凍結語意，
+    /// 不做任何平滑）。A3 overlay 畫目標環讀這裡。
+    private(set) var targetPoint: NPoint?
+    /// 承諾目標的鎖定狀態（GuidanceTracker 遲滯 + dwell）。
+    private(set) var lockState: LockState = .searching
+    /// 平滑錨點到承諾目標的歐氏距離（normalized）；無解時 nil。
+    private(set) var alignDistance: Double?
     /// 已過 AdviceStabilizer 的顯示建議（防箭頭閃爍）。
     private(set) var advice: CoachAdvice?
     /// 分數 EMA（alpha 0.25）。
     private(set) var smoothedScore: Double = 0
     /// smoothedScore 的整數版：只在整數值變化時才寫入 —
-    /// RootView（快門外圈）讀這個，避免大型 view body 以 ~10fps 重算 diff（見檔尾註記）。
+    /// RootView（快門外圈）讀這個，避免大型 view body 以 ~15fps 重算 diff（見檔尾註記）。
     private(set) var displayScore: Int = 0
     /// 分析 buffer 的直立寬高比（寬/高；預設 3:4）。CoachOverlayView 的
     /// AspectFillMapper 取代寫死比例用；僅在收到有效直立帧時更新。
@@ -53,6 +73,11 @@ final class CoachSession {
     @ObservationIgnored private var isActive = false
     @ObservationIgnored private var hasAttachedTap = false
     @ObservationIgnored private var wasLocked = false
+    /// 最新發布世代（MainActor）：resetGuidance / setActive(true) 時取
+    /// pipeline.scheduleReset() 的回傳值。publish 比對 Output.generation —
+    /// 重置前已進入處理、尚在 Task 佇列的舊座標帧一律丟棄
+    /// （否則清空後的發布會被舊環蓋回新畫面 ~1 帧）。
+    @ObservationIgnored private var expectedGeneration = 0
     @ObservationIgnored private var lastAutoCaptureAt: Double = -.greatestFiniteMagnitude
     @ObservationIgnored private var thermalObserver: NSObjectProtocol?
     @ObservationIgnored private let lockHaptics = UINotificationFeedbackGenerator()
@@ -79,6 +104,12 @@ final class CoachSession {
             }
         }
         applyThermalPolicy()
+
+        // 前後鏡切換完成／鏡位切換 = 取景座標整體跳變 → 全導引管線重置
+        // （planner 承諾目標、One-Euro、tracker、stabilizer 都不得帶舊座標）
+        camera.onCameraReconfigured = { [weak self] in
+            self?.resetGuidance()
+        }
     }
 
     deinit {
@@ -101,7 +132,8 @@ final class CoachSession {
             }
             // tap connection 恢復出帧（sessionQueue 序列化，恆排在 attach 之後）
             camera.setVideoTapEnabled(true)
-            pipeline.scheduleReset()
+            expectedGeneration = pipeline.scheduleReset()
+            tap.analyzer.scheduleReset()
             applyThermalPolicy()
             tap.analyzer.startMotion()
             tap.setActive(true)
@@ -115,12 +147,30 @@ final class CoachSession {
             facts = nil
             result = nil
             guidance = nil
+            anchorPoint = nil
+            targetPoint = nil
+            lockState = .searching
+            alignDistance = nil
             advice = nil
             smoothedScore = 0
             displayScore = 0
             analysisFPS = 0
             wasLocked = false
         }
+    }
+
+    /// 相機重配（flipCamera / 鏡位切換）後：排程分析管線 + 分析器快取重置、
+    /// 立即清空導引發布狀態，並推進發布世代（重置前已在處理的舊帧
+    /// publish 時被世代比對丟棄 — 不讓舊環在新畫面上多留一帧）。
+    private func resetGuidance() {
+        expectedGeneration = pipeline.scheduleReset()
+        tap.analyzer.scheduleReset()
+        guidance = nil
+        anchorPoint = nil
+        targetPoint = nil
+        lockState = .searching
+        alignDistance = nil
+        wasLocked = false
     }
 
     /// 最新分析帧轉 JPEG（同步；教練未啟用或尚無帧時 nil）。導演即時模式取帧用。
@@ -137,13 +187,26 @@ final class CoachSession {
     // MARK: - 發布（MainActor）
 
     private func publish(_ output: CoachPipeline.Output, bufferWidth: Int, bufferHeight: Int) {
-        guard isActive else { return }
+        // 世代比對：重置（切鏡/翻鏡/重啟）前已開始處理的帧帶舊座標 → 丟棄。
+        guard isActive, output.generation == expectedGeneration else { return }
         facts = output.facts
         result = output.result
         guidance = output.guidance
         advice = output.advice
         smoothedScore = output.smoothedScore
         analysisFPS = output.analysisFPS
+
+        // 契約新 surface：anchor/distance 逐帧變、直接寫；
+        // target（凍結）與 lockState 少變 → 只在值變化時寫入
+        // （@Observable 逐屬性追蹤：不寫就不觸發讀取端 diff）
+        anchorPoint = output.guidance.anchor
+        alignDistance = output.guidance.normalizedDistance
+        if output.guidance.target != targetPoint {
+            targetPoint = output.guidance.target
+        }
+        if output.guidance.lockState != lockState {
+            lockState = output.guidance.lockState
+        }
 
         // 整數分數只在值變化時寫入（@Observable 逐屬性追蹤：不寫就不觸發 diff）
         let score = Int(output.smoothedScore.rounded())
@@ -186,7 +249,8 @@ final class CoachSession {
         let state = ProcessInfo.processInfo.thermalState
         let reduced = state == .serious || state == .critical
         thermalReduced = reduced
-        tap.setMinAnalysisInterval(reduced ? 0.25 : 0.1)
+        // 正常 0.066s ≈ 15fps（提速輪 0.1 → 0.066）；熱降級 0.25s + 停 body pose
+        tap.setMinAnalysisInterval(reduced ? 0.25 : 0.066)
         tap.analyzer.setBodyPoseEnabled(!reduced)
     }
 }
@@ -204,35 +268,57 @@ private final class CoachPipeline {
         var advice: CoachAdvice?
         var smoothedScore: Double
         var analysisFPS: Double
+        /// 本帧開始處理時的發布世代（scheduleReset 每次 +1）。
+        /// CoachSession.publish 比對最新世代 — 重置「前」已在處理的舊座標帧
+        /// 抵達 MainActor 時世代已過期 → 丟棄，杜絕清空後被舊帧蓋回 ~1 帧。
+        var generation: Int
     }
 
     private let engine = RuleCompositionEngine()
     private let config = ScoringConfig.standard
     private let stabilizer = AdviceStabilizer()
     private var scoreSmoother = ScoreSmoother(alpha: 0.25)
-    private var anchorSmoother = PointSmoother(alpha: 0.35)
-    private var targetSmoother = PointSmoother(alpha: 0.35)
-    private var tracker = GuidanceTracker()
+    /// 錨點 One-Euro 濾波（A1）：近靜止強力去抖、快速移動低延遲。
+    /// beta 必須配 OneEuroFilter 檔頭的速度尺度（畫面/秒；預設 20）— 舊值 0.25
+    /// 低了 ~80 倍，快速重構圖時 fc 只升到 <1 Hz，退化成固定延遲 EMA（用戶
+    /// 抱怨的「很慢」）。手算（15fps、dt=1/15）：v=0.05 畫面/秒（慢速微調）→
+    /// fc = 0.6 + 15×0.05 = 1.35 Hz（α≈0.36，仍濾抖）；v=1.0（快速重構圖）→
+    /// fc = 15.6 Hz（r = 2π×15.6/15 = 6.53、α = 6.53/7.53 ≈ 0.87，幾乎即時跟上）。
+    /// minCutoff 0.6 維持靜止穩定。待真機微調。
+    private let anchorFilter = OneEuroFilter2D(minCutoff: 0.6, beta: 15.0, dCutoff: 1.0)
+    /// 目標承諾規劃器（A1）：目標一經承諾即凍結，換側需遲滯＋停留 —
+    /// 根治「目標跟著主體逐帧重算 = 追會跑的靶」。target 絕不再過任何平滑。
+    private let planner = StickyTargetPlanner()
+    private let tracker = GuidanceTracker()
     private var recentIntervals: [Double] = []
     private var lastTimestamp: Double?
     /// 上一帧的前後鏡標記：切鏡瞬間 buffer 鏡像翻轉、座標跳變，
-    /// 必須重置（否則 smoother 從舊位置滑過去、tracker 可能短暫保持錯誤 locked）。
+    /// 必須重置（否則 One-Euro 從舊位置滑過去、planner 保著錯誤承諾目標、
+    /// tracker 可能短暫維持錯誤 locked）。與 CameraController.onCameraReconfigured
+    /// 的重置互為雙保險（此處以 facts 流本身偵測，不依賴通知時序）。
     private var lastIsFront: Bool?
 
     private let resetLock = NSLock()
     private var resetPending = false
+    /// 發布世代（resetLock 保護）：scheduleReset 每次 +1，process 蓋進 Output。
+    private var generation = 0
 
     /// 任意執行緒可呼叫；實際重置延到下一次 process（分析 queue 上）執行。
-    func scheduleReset() {
+    /// 回傳新世代 — 呼叫端以此為基準過濾稍後才抵達 MainActor 的舊帧輸出。
+    @discardableResult
+    func scheduleReset() -> Int {
         resetLock.lock()
+        defer { resetLock.unlock() }
         resetPending = true
-        resetLock.unlock()
+        generation += 1
+        return generation
     }
 
     func process(_ facts: FrameFacts) -> Output {
         resetLock.lock()
         let doReset = resetPending
         resetPending = false
+        let currentGeneration = generation
         resetLock.unlock()
         if doReset {
             resetState()
@@ -244,12 +330,20 @@ private final class CoachPipeline {
         lastIsFront = facts.isFrontCamera
 
         let result = engine.evaluate(facts, config: config)
-        var guidance = TargetSolver.solve(facts: facts, result: result)
-        // solver 一律回 .searching；鎖定判斷交給 tracker（遲滯 + 停留時間）
+        var solved = TargetSolver.solve(facts: facts, result: result)
+        // 錨點 One-Euro 平滑「先於」planner（A1 契約：StickyTargetPlanner.update 的
+        // 呼叫端注釋要求把平滑後錨點放進 solved.anchor 再餵入 — 承諾時機與越線
+        // dwell 都以平滑錨點判定）。餵 nil = 主體消失 → 濾波器重置，重現時不從
+        // 舊位置滑過去；平滑不改變 nil/非 nil，presence/grace 語意不受影響。
+        solved.anchor = anchorFilter.update(solved.anchor, at: facts.timestamp)
+        // 承諾目標：planner 決定何時換目標（側邊遲滯＋停留＋主體短暫消失寬限）。
+        // 承諾後 target 凍結不動 — 凍結本身就是最強穩定，絕不再對 target 平滑。
+        // 凍結期間的 normalizedDistance / cameraMoveHint 由 planner 以「平滑錨點 →
+        // 承諾目標」重算（frozenGuidance，與 TargetSolver 同語意、同 1e-9 防除零）
+        // — alignDistance 契約語意在此已滿足，管線不再重複計算。
+        var guidance = planner.update(facts: facts, result: result, solved: solved, at: facts.timestamp)
+        // 鎖定判斷：tracker（遲滯 + 停留時間）對「承諾目標」的距離判定
         guidance.lockState = tracker.update(distance: guidance.normalizedDistance, at: facts.timestamp)
-        // 錨點／目標點 EMA 平滑（餵 nil 會重置各自的 smoother）
-        guidance.anchor = anchorSmoother.update(guidance.anchor)
-        guidance.target = targetSmoother.update(guidance.target)
 
         // 目標環（target）本身就是三分構圖位置指引的上位替代（含 yaw 視線空間 /
         // headroom 修正）：Rules.thirds 的文字建議取「就近三分線」，與 solver 的
@@ -283,16 +377,17 @@ private final class CoachPipeline {
             guidance: guidance,
             advice: advice,
             smoothedScore: smoothed,
-            analysisFPS: fps
+            analysisFPS: fps,
+            generation: currentGeneration
         )
     }
 
     private func resetState() {
         stabilizer.reset()
         scoreSmoother.reset()
-        _ = anchorSmoother.update(nil)
-        _ = targetSmoother.update(nil)
-        tracker = GuidanceTracker()   // 契約無 reset()：重建即重置
+        anchorFilter.reset()
+        planner.reset()
+        tracker.reset()
         recentIntervals = []
         lastTimestamp = nil
         lastIsFront = nil
@@ -300,6 +395,9 @@ private final class CoachPipeline {
 }
 
 //  發布頻率備註（給 A3 / reviewer）：
-//  Observation 是逐屬性追蹤 — 只讀 advice / smoothedScore / guidance 的 view
-//  只在該屬性變動時 diff；facts 每次分析（~10fps）都變，只有教練 overlay 的
-//  Canvas 這類本來就要逐帧重繪的 view 才應該讀 facts，不要在大型 view body 裡讀。
+//  Observation 是逐屬性追蹤 — 只讀 advice / smoothedScore / lockState 的 view
+//  只在該屬性變動時 diff；facts / anchorPoint / alignDistance 每次分析（~15fps）
+//  都變，只有教練 overlay 的 Canvas 這類本來就要逐帧重繪的 view 才應該讀，
+//  不要在大型 view body 裡讀。targetPoint（凍結）與 lockState 只在值變化時寫入。
+//  分析 ~15fps、渲染 60fps：A3 overlay 若要更順，可對 anchorPoint 做
+//  顯示端補間（分析層不再加平滑，補間屬渲染層自由）。

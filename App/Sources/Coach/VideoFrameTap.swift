@@ -49,7 +49,7 @@ final class VideoFrameTap: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     private var latestPixelBuffer: CVPixelBuffer?
     private var _isActive = false
     private var _isFrontCamera = false
-    private var _minAnalysisInterval: Double = 0.1
+    private var _minAnalysisInterval: Double = 0.066
 
     // MARK: - analysisQueue 專屬狀態（不需鎖）
 
@@ -85,7 +85,7 @@ final class VideoFrameTap: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         lock.unlock()
     }
 
-    /// 分析節流間隔（熱降級時 CoachSession 調成 0.25s，正常 0.1s ≈ 10fps）。
+    /// 分析節流間隔（熱降級時 CoachSession 調成 0.25s，正常 0.066s ≈ 15fps）。
     func setMinAnalysisInterval(_ interval: Double) {
         lock.lock()
         _minAnalysisInterval = interval
