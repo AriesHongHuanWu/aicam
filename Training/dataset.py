@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""dataset.py — Reframe 弱監督配對資料集 v3（MASTER-PLAN §4.3）。
+"""dataset.py — Reframe 弱監督配對資料集 v4（MASTER-PLAN §4.3）。
 
 v2 訓練實測 val pairwise acc ≈ 0.53（丟銅板）— 驗屍結論（Kaggle run v2）：
   (a) 正負例處理管線不對稱（正例 1 次 resize；負例裁切+旋轉+縮放 2 次重採樣）
@@ -117,7 +117,9 @@ class ReframePairDataset(Dataset):
         self.epoch = 0
         # v4：訓練增強旗標。預設 False（驗證/評測走乾淨路徑），train.py 於
         # 訓練 epoch 設 True、驗證前設回 False（DataLoader 每輪重建 iterator，
-        # worker 會拿到當下的 dataset 狀態）。
+        # worker 會拿到當下的 dataset 狀態）。前提：DataLoader 絕不可開
+        # persistent_workers —— 那會讓 worker 凍住舊的 augment/epoch 狀態，
+        # 驗證會在增強路徑上跑出假數字。
         self.augment = False
         if not os.path.isdir(img_dir):
             raise FileNotFoundError(f"找不到圖片目錄：{img_dir}")

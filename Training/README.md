@@ -9,7 +9,9 @@ GitHub Actions（Windows 裝不了 coremltools，見下方〈CoreML 匯出〉）
 Weakly-supervised（免人工標註）：
 
 - **正例** = 專業照片的**完整原始取景**（全帧視窗，不做 center crop —— v2 的
-  center crop 會砍掉橫幅左右 1/3，構圖訊號根本進不了正例）
+  center crop 會砍掉橫幅左右 1/3，構圖訊號根本進不了正例）。v4 起訓練 epoch
+  改用近全帧微抖動視窗 scale U(0.95, 1.0)（消除 v3 恆定 pos 的逐張記憶錨點，
+  與負例上限 0.90 保留間隙）；驗證/評測仍用乾淨全帧
 - **負例** = 同一張圖內的**同長寬比**隨機視窗（scale U(0.55, 0.90)、位置均勻、
   **無旋轉**）—— 模擬「取景取偏了／太緊」；歪斜由 App 層 CoreMotion 規則負責
 - 兩支走**完全相同**的 crop → squash resize（PIL BILINEAR）路徑：同插值、同
@@ -18,8 +20,13 @@ Weakly-supervised（免人工標註）：
   content-controlled AUC ≈ 0.5，判定不構成作弊通道 —— 但**不可**換成
   torch/cv2 的 naive bilinear，也**不可**換高解析資料源（細節與載重不變量
   見 `dataset.py` docstring）
-- **免費監督訊號** = 擾動量本身：負例視窗中心相對圖中心的偏移
-  `(dx, dy)`（相對 w、h 的比例）與 `dzoom = log(1/scale)` ∈ (0.105, 0.598)
+- **免費監督訊號** = 擾動量本身：視窗中心相對圖中心的偏移 `(dx, dy)`（相對
+  w、h 的比例）與 `dzoom = log(1/scale)`（neg ∈ (0.105, 0.598)；v4 起 pos/neg
+  各回傳一支 delta，pos 的在 0 附近）
+- **v4 對稱增強**（只在訓練 epoch 開）：光度（亮度/對比/飽和/偶爾灰階/偶爾輕
+  模糊）與水平翻轉，**同一組參數同時套 pos 與 neg、在 resize 後輸出空間執行**；
+  翻轉時兩支 delta 的 dx 同步取負。任何只套一支的增強都是作弊通道（已用
+  內容受控 AUC 實測對稱性 ≈ 0.5，見 `dataset.py` docstring）
 
 模型 `ReframeNet` = MobileNetV3-Small（ImageNet 預訓練）+ 共享 trunk + 兩顆頭：
 
@@ -28,9 +35,14 @@ Weakly-supervised（免人工標註）：
   → App 端的修正指令 = **−delta**：dx > 0（框偏右）→ 相機往左移；
   dy > 0（框偏下）→ 取景抬高；dzoom > 0（取景比理想更緊）→ 退後或換廣角
 
-損失 = `MarginRankingLoss(margin=0.5)(score_pos, score_neg)`
-　　 + `0.5 × SmoothL1(delta_neg_pred, delta_gt)`
-　　 + `0.1 × SmoothL1(delta_pos_pred, 0)`
+損失（v4）= `softplus(-(score_pos - score_neg)).mean()`（BPR 型，不飽和）
+　　 + `1.0 × SmoothL1(delta_neg_pred/D, delta_neg_gt/D)`
+　　 + `0.3 × SmoothL1(delta_pos_pred/D, delta_pos_gt/D)`，`D = (0.225, 0.225, 0.598)`
+　　（各維以標籤上限正規化；未正規化時 delta 項僅占總損失 ~2%，delta 頭學不動）
+
+v4 其他抗過擬合手段（動機：v3 實測 val 0.63 / train loss 0.004 = 逐張過擬合）：
+trunk Dropout(0.2)、AdamW weight_decay 0.01、backbone 學習率 0.1×（heads 全速）、
+每 epoch 印 train pairwise acc 監控泛化差距。
 
 ## 檔案總覽
 
