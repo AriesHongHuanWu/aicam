@@ -14,8 +14,24 @@
 //  - 場景分類 VNClassifyImageRequest（v0.3.0 F12 調色推薦）：每 ~1s 一次，
 //    confidence > 0.3 前 5 個 identifier；兩次之間沿用快取（場景變化慢，
 //    ≤1s 陳舊可接受）；perform 失敗清空（誠實：拿不到就空陣列）。
+//  - 人像分割（v0.5.0 特效 mask）：僅當 effect.selected != "none" 且
+//    effect.liveEnabled 且 look.livePreview（Metal 取景器＝唯一 live mask 消費者）
+//    且熱狀態 < serious 時，每 2 次 tick 跑一次
+//    SegmentationEngine.liveMask（~7fps）→ MaskStore（MainActor、帶序號防亂序）。
+//    特效關閉 = 零 Vision 呼叫零成本（engine 為 lazy，連 request 都不建）；
+//    關閉／熱降級／切鏡時發 nil 清空 MaskStore。%2==0 與 body pose（%3==1）
+//    每 6 tick 疊一次（tick 4、10…），無法完全錯開，已知取捨。
+//    v0.5.0 修正輪：教練分析未啟用（拍照等模式）時另有獨立入口
+//    runStandaloneSegmentationIfDue（VideoFrameTap 呼叫、0.15s 節流 ≈ 同節奏）—
+//    取景即時特效不再只綁教練模式。
 //  - VNDetectFaceCaptureQualityRequest：本檔「沒有」執行（FaceFact.captureQuality
 //    恆為 nil，屬 P4 篩選範疇），即時管線不付這筆成本。
+//
+//  v0.5.0 群組合照（A3）：最大臉無條件保留（單人行為完全不變）；第 2、3 張臉
+//  需過 Vision confidence 門檻才進 facts（低信心殘影不得觸發群組模式）。
+//  ≥2 臉時 subjectBox = 所有臉框 union 各邊外擴 15% 後 clamp 0…1（整群 = 主體；
+//  下游 TargetSolver / GroupGuard / isGroupMode 全以 faces.count ≥ 2 判群組，
+//  門檻在本檔一處把關，語意自動一致）。
 //
 //  座標鐵律：
 //  - Vision 輸出 normalized、原點左下、y 向上 → 一律經 VisionCoordinateMapping 轉
@@ -44,6 +60,11 @@ final class FrameAnalyzer {
     private let saliencyRequest = VNGenerateAttentionBasedSaliencyImageRequest()
     /// 場景分類（F12 調色推薦）：每 ~1s 才 perform 一次（見檔頭節奏）。
     private let classifyRequest = VNClassifyImageRequest()
+    /// v0.5.0 群組偵測：第 2 張臉起需過的 Vision confidence 門檻。
+    /// 最大臉「無條件」保留 — 單人行為完全不變；此門檻只擋「額外」的低信心
+    /// 觀測誤觸發群組模式。VNDetectFaceRectanglesRequest 對真臉通常 > 0.9，
+    /// 0.5 屬保守（啟發式，待真機驗證）。
+    private static let groupFaceMinConfidence: Float = 0.5
 
     // MARK: - analysisQueue 專屬狀態
 
@@ -61,6 +82,17 @@ final class FrameAnalyzer {
     /// 上一帧的前後鏡標記：變化 = 座標空間鏡像跳變 → 就地清跨帧快取
     /// （與 scheduleReset 雙保險，不依賴通知時序）。
     private var lastIsFront: Bool?
+    /// 人像分割引擎（v0.5.0；lazy = 特效從未啟用時連 request 物件都不建，
+    /// 效能守護契約「零成本」）。lazy var 非執行緒安全，但只在 analysisQueue 觸碰。
+    private lazy var segmentation = SegmentationEngine()
+    /// mask 發布序號（單調遞增、不隨 clearFrameCaches 歸零）：MaskStore.apply
+    /// 以此丟棄亂序抵達 MainActor 的舊發布（清空不得被舊 mask 蓋回）。
+    private var maskSequence = 0
+    /// MaskStore 目前是否持有本分析器發布的 mask（避免特效關閉後每 tick 重複發 nil）。
+    private var maskPublished = false
+    /// 獨立分割 tick 的節流基準（v0.5.0 修正輪：教練分析未啟用時的即時特效
+    /// 路徑；analysisQueue 專屬）。
+    private var lastStandaloneSegmentationAt: Double = -.greatestFiniteMagnitude
 
     // MARK: - 跨執行緒狀態（stateLock 保護）
 
@@ -144,6 +176,8 @@ final class FrameAnalyzer {
         // overlay 畫到完全錯的位置。橫向（寬 > 高）即判定旋轉未生效：誠實回
         // 「無視覺觀測」的 FrameFacts（教練退化為只剩水平儀，而不是給錯座標）。
         guard bufferHeight >= bufferWidth else {
+            // 無視覺觀測路徑：mask 也不得殘留（若曾發布過 → 清空一次）
+            publishMaskClear()
             let (rollDeg, pitchDeg) = motionAngles(gravity: gravity, isFront: isFront)
             return FrameFacts(
                 horizonRollDeg: rollDeg,
@@ -180,12 +214,22 @@ final class FrameAnalyzer {
             : []
         // landmarks 請求的觀測自帶 bbox；完全沒有時退回 rectangles 結果
         let sourceFaces = landmarkFaces.isEmpty ? rectFaces : landmarkFaces
-        let topFaces = sourceFaces
-            .sorted {
-                $0.boundingBox.width * $0.boundingBox.height
-                    > $1.boundingBox.width * $1.boundingBox.height
+        // v0.5.0 群組偵測門檻：面積排序後，最大臉（index 0）無條件保留 —
+        // 單人行為完全不變（不論其 confidence，跟過去一樣進 facts）；
+        // 第 2 張臉起需 confidence 過門檻才算群組成員。低信心殘影不觸發群組
+        // （union 主體框／GroupGuard／isGroupMode 全以 facts.faces.count ≥ 2
+        // 判群組 — 門檻在此一處把關，下游語意自動一致）。上限仍為 3 張臉。
+        let rankedFaces = sourceFaces.sorted {
+            $0.boundingBox.width * $0.boundingBox.height
+                > $1.boundingBox.width * $1.boundingBox.height
+        }
+        var topFaces: [VNFaceObservation] = []
+        for (rank, observation) in rankedFaces.enumerated() {
+            guard topFaces.count < 3 else { break }
+            if rank == 0 || observation.confidence >= Self.groupFaceMinConfidence {
+                topFaces.append(observation)
             }
-            .prefix(3)
+        }
 
         var faces: [FaceFact] = []
         for (index, observation) in topFaces.enumerated() {
@@ -267,6 +311,10 @@ final class FrameAnalyzer {
             }
         }
 
+        // 人像分割（v0.5.0 特效 mask）：節奏／開關／熱降級判斷見函式注釋。
+        // 放在 faces 之後 — personCount 由本帧臉數帶入（契約）。
+        runSegmentationIfDue(pixelBuffer: pixelBuffer, timestamp: timestamp, faceCount: faces.count)
+
         let subjectBox = makeSubjectBox(faces: faces, joints: joints, timestamp: timestamp)
         let histogram = makeHistogram(pixelBuffer: pixelBuffer)
         let (rollDeg, pitchDeg) = motionAngles(gravity: gravity, isFront: isFront)
@@ -296,6 +344,91 @@ final class FrameAnalyzer {
         noFaceSince = nil
         lastClassifyAt = -.greatestFiniteMagnitude
         lastSceneTags = []
+        // 切鏡/翻鏡 = mask 座標空間跳變 → 立即清空 MaskStore（不留舊空間 mask
+        // 給合成端多畫 1–2 tick 的錯位特效）。maskSequence 不歸零（單調防亂序）。
+        publishMaskClear()
+    }
+
+    // MARK: - 人像分割（v0.5.0 特效 mask；只在 analysisQueue 呼叫）
+
+    /// 分割節奏守門：
+    /// - effect.selected == "none" 或 effect.liveEnabled 關 → 零 Vision 呼叫
+    ///   （若曾發布過 mask → 清空一次）。liveEnabled 預設 true（契約）。
+    /// - look.livePreview 關（Metal 取景器退回 PreviewLayerView）→ live mask
+    ///   無任何消費者（拍照烘焙走 accurateMask）→ 同樣停跑＋清空（v0.5.0 修正輪；
+    ///   metalFailed 屬 App 層 @State 無法直讀，罕見路徑不覆蓋）。
+    /// - 熱降級 ≥ .serious → 停跑 + 清空（直讀 thermalState，不依賴 MainActor
+    ///   通知時序 — 與 CoachPipeline.runModelTickIfDue 同判準）。
+    /// - 每 2 次分析 tick 跑一次（15fps 分析 → mask ~7fps；mask 是低頻輔助層，
+    ///   合成端拿最近一張即可，取景不因此掉帧）。
+    /// - liveMask 失敗（perform throw）→ 沿用已發布 mask（短暫失敗不閃爍；
+    ///   長期失敗 = mask 陳舊 — 時效防護在「渲染端」：MetalPreviewView.draw 以
+    ///   MaskStore.publishedAt 做 0.5s 時效判定，陳舊 mask 自然熄滅，本處不重複）。
+    private func runSegmentationIfDue(pixelBuffer: CVPixelBuffer, timestamp: Double, faceCount: Int) {
+        guard segmentationGateOpen() else { return }
+        guard analysisCount % 2 == 0 else { return }
+        performSegmentation(pixelBuffer: pixelBuffer, timestamp: timestamp, faceCount: faceCount)
+    }
+
+    /// v0.5.0 修正輪：教練分析「未啟用」時的獨立分割入口（拍照等模式的取景
+    /// 即時特效 — 分割節奏不能只綁在教練 analyze，否則主拍照模式選特效時
+    /// MaskStore 永遠拿不到 mask、預覽整條斷路）。VideoFrameTap 在「有預覽
+    /// 消費者」的帧上呼叫（analysisQueue — 與 analyze 同 serial queue，
+    /// 狀態不跨執行緒）。節流 0.15s ≈ 7fps，與教練路徑同節奏。
+    /// faceCount：本路徑無臉部觀測 → 0（MaskStore.personCount 目前無讀取端，
+    /// 語意為「最近一次發布時的已知偵測人數」）。
+    func runStandaloneSegmentationIfDue(pixelBuffer: CVPixelBuffer, timestamp: Double) {
+        guard segmentationGateOpen() else { return }
+        guard timestamp - lastStandaloneSegmentationAt >= 0.15 else { return }
+        lastStandaloneSegmentationAt = timestamp
+        performSegmentation(pixelBuffer: pixelBuffer, timestamp: timestamp, faceCount: 0)
+    }
+
+    /// 分割守門共用判定（analysisQueue）：開關／取景器可見性／熱降級。
+    /// 任一不滿足 → 清空一次（僅曾發布過時）並回 false。
+    private func segmentationGateOpen() -> Bool {
+        // @AppStorage 在非 View 不可靠 → 直讀 UserDefaults（CoachPipeline 同慣例）
+        let defaults = UserDefaults.standard
+        let selected = defaults.string(forKey: "effect.selected") ?? "none"
+        let liveEnabled = (defaults.object(forKey: "effect.liveEnabled") as? Bool) ?? true
+        let livePreview = (defaults.object(forKey: "look.livePreview") as? Bool) ?? true
+        guard selected != "none", liveEnabled, livePreview else {
+            publishMaskClear()
+            return false
+        }
+        let thermal = ProcessInfo.processInfo.thermalState
+        guard thermal != .serious, thermal != .critical else {
+            publishMaskClear()
+            return false
+        }
+        return true
+    }
+
+    /// 實際分割＋發布（analysisQueue；守門通過後呼叫）。
+    private func performSegmentation(pixelBuffer: CVPixelBuffer, timestamp: Double, faceCount: Int) {
+        guard let mask = segmentation.liveMask(for: pixelBuffer) else { return }
+
+        maskPublished = true
+        maskSequence += 1
+        let sequence = maskSequence
+        // mask buffer 跨執行緒轉手：Vision 每次 perform 產新 buffer、回傳後無人
+        // 再寫入 → 實質唯讀轉移（Swift 5 模式 Sendable 僅警告；MaskStore 檔頭注釋）。
+        Task { @MainActor in
+            MaskStore.shared.apply(
+                mask: mask, timestamp: timestamp, personCount: faceCount, sequence: sequence
+            )
+        }
+    }
+
+    /// MaskStore 清空（僅在曾發布過時發一次 nil；analysisQueue 專屬）。
+    private func publishMaskClear() {
+        guard maskPublished else { return }
+        maskPublished = false
+        maskSequence += 1
+        let sequence = maskSequence
+        Task { @MainActor in
+            MaskStore.shared.apply(mask: nil, timestamp: 0, personCount: 0, sequence: sequence)
+        }
     }
 
     // MARK: - 臉
@@ -455,12 +588,20 @@ final class FrameAnalyzer {
 
     // MARK: - 主體框
 
-    /// 主體框（人優先）：主要臉框 ∪ 可信關節點（≥0.3）bbox，左右各外擴 2%、下緣 +4%
-    /// （關節點不含腳掌）後 clamp 0…1。只有臉、沒有可信關節時「不」憑空造主體框 —
-    /// 引擎的占比規則會自然回「不適用」（誠實原則）。無臉時用 2.5s 內的 saliency 框。
+    /// 主體框（人優先）：
+    /// - v0.5.0 群組（≥2 張過信心門檻的臉）：所有臉框 union 各邊外擴 15% 後
+    ///   clamp 0…1（整群 = 主體；TargetSolver 據此把導引錨點換成整群中心）。
+    ///   群組時「不」混入關節點 — body pose 只支援單人（見 extractJoints），
+    ///   單人骨架拉伸 union 會把整群框偏向其中一人。
+    /// - 單人：主要臉框 ∪ 可信關節點（≥0.3）bbox，左右各外擴 2%、下緣 +4%
+    ///   （關節點不含腳掌）後 clamp 0…1。只有臉、沒有可信關節時「不」憑空造主體框 —
+    ///   引擎的占比規則會自然回「不適用」（誠實原則）。無臉時用 2.5s 內的 saliency 框。
     private func makeSubjectBox(
         faces: [FaceFact], joints: [JointFact], timestamp: Double
     ) -> NRect? {
+        if faces.count >= 2 {
+            return Self.groupUnionBox(faces: faces)
+        }
         if let face = faces.max(by: { $0.box.area < $1.box.area }) {
             let confident = joints.filter { $0.confidence >= 0.3 }
             guard !confident.isEmpty else { return nil }
@@ -483,6 +624,31 @@ final class FrameAnalyzer {
             return box
         }
         return nil
+    }
+
+    /// v0.5.0 群組主體框：所有臉框 union，四邊各外擴「union 對應邊長的 15%」
+    /// 後 clamp 0…1。外擴理由：臉框只涵蓋頭部 — 15% 把髮頂／肩線一帶納入，
+    /// 讓占比（subjectSize）與三分／置中規則拿到更接近「整群人」的框；
+    /// 只有臉觀測、沒有全群骨架，任何更大的外擴都是猜身體（誠實原則：
+    /// 寧可保守），寬幅合照時也不至於把大片背景吃進主體框。
+    private static func groupUnionBox(faces: [FaceFact]) -> NRect {
+        var minX = Double.greatestFiniteMagnitude
+        var minY = Double.greatestFiniteMagnitude
+        var maxX = -Double.greatestFiniteMagnitude
+        var maxY = -Double.greatestFiniteMagnitude
+        for face in faces {
+            minX = min(minX, face.box.minX)
+            minY = min(minY, face.box.minY)
+            maxX = max(maxX, face.box.maxX)
+            maxY = max(maxY, face.box.maxY)
+        }
+        let dx = (maxX - minX) * 0.15
+        let dy = (maxY - minY) * 0.15
+        let x0 = max(0, minX - dx)
+        let y0 = max(0, minY - dy)
+        let x1 = min(1, maxX + dx)
+        let y1 = min(1, maxY + dy)
+        return NRect(x: x0, y: y0, width: max(0, x1 - x0), height: max(0, y1 - y0))
     }
 
     // MARK: - 像素統計（自寫取樣，不用 vImage 以避 API 風險）

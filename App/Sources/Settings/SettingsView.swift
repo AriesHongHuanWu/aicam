@@ -3,7 +3,7 @@
 //
 //  區塊：AI 導演（開關 / Gemini API Key / 模型選擇 / 測試連線）、
 //        AI 智慧（構圖模型 / AI 代操曝光，v0.3.0；AI 自動變焦 / 變焦建議，v0.4.0）、
-//        調色（即時濾鏡預覽 / AI 自動選 Look / 同時保留原圖，v0.3.0）、
+//        調色（即時濾鏡預覽 / 即時特效預覽 v0.5.0 / AI 自動選 Look / 同時保留原圖）、
 //        教練（自動抓拍 / 導演即時建議，P2）、
 //        拍攝（網格線 P0 佔位）、關於（版本）。
 //  模型選擇（跨模組契約）：
@@ -46,6 +46,9 @@ struct SettingsView: View {
     @AppStorage("look.livePreview") private var lookLivePreview = true
     @AppStorage("look.autoApply") private var lookAutoApply = false
     @AppStorage("look.keepOriginal") private var lookKeepOriginal = false
+    /// v0.5.0 特效（跨模組契約 key；預設 true）。@AppStorage 宣告的預設值不會寫入
+    /// UserDefaults — RootView 端以 object(forKey:) 判「無值」套同樣預設，語意相容。
+    @AppStorage("effect.liveEnabled") private var effectLiveEnabled = true
 
     // MARK: - 畫面狀態
 
@@ -308,6 +311,11 @@ struct SettingsView: View {
             }
             .tint(Tokens.gray2)
 
+            Toggle(isOn: $effectLiveEnabled) {
+                settingLabel("即時特效預覽", icon: "person.and.background.dotted")
+            }
+            .tint(Tokens.gray2)
+
             Toggle(isOn: $lookAutoApply) {
                 HStack(spacing: 12) {
                     iconTile("wand.and.rays")
@@ -328,7 +336,7 @@ struct SettingsView: View {
         } header: {
             sectionHeader("調色")
         } footer: {
-            Text("即時濾鏡預覽在取景器直接呈現選中 Look，關閉可省電。同時保留原圖會在套用 Look 時額外儲存一張未調色的原始照片。")
+            Text("即時濾鏡預覽在取景器直接呈現選中 Look，關閉可省電。即時特效預覽關閉後，特效僅在拍攝成品套用，可省電。同時保留原圖會在套用 Look 時額外儲存一張未調色的原始照片。")
                 .font(Tokens.label(12))
                 .foregroundStyle(Tokens.gray2)
         }

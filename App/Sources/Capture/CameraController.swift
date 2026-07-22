@@ -57,7 +57,8 @@ final class CameraController {
     var onCameraReconfigured: (() -> Void)?
 
     /// 拍照 Look 供應者（v0.3.0 契約；A3/A4 接線）。
-    /// 拍照處理於「背景 queue」呼叫（契約明定）：回 nil 或 passthrough = 不烘焙。
+    /// 拍照處理於「背景 queue」呼叫（契約明定）：回 nil 或 passthrough = 不烘焙 Look
+    /// （v0.5.0：特效已選時仍會以 passthrough 進烘焙管線套特效，見 capturePhoto）。
     /// 閉包必須執行緒安全 — 建議只讀不可變值或 UserDefaults，
     /// 勿在閉包內碰 MainActor 隔離狀態（Swift 5 模式不會擋，靠紀律）。
     @ObservationIgnored var captureLookProvider: (() -> LookRecipe?)?
@@ -158,9 +159,14 @@ final class CameraController {
         guard let data = await service.capturePhoto() else { return }
 
         // v0.3.0 Look 烘焙：provider 於「背景 queue」呼叫（契約）；
-        // nil / passthrough → lookJPEG = nil，流程與 v0.2.1 完全相同。
+        // nil / passthrough 且無特效 → lookJPEG = nil，流程與 v0.2.1 完全相同。
         // 縮圖與教練/導演 1280px JPEG 一律以「實際存入相簿的樣子」為準
         //（有 Look 用烘焙後影像 — 縮圖、導演評語都對應用戶真正拿到的照片）。
+        //
+        // v0.5.0 修正輪：Look=原色（provider 回 nil/passthrough）但特效已選時，
+        // 「仍須」以 passthrough 進烘焙管線 — bakeLook 自讀 effect.selected 套特效、
+        // LookEngine 對 passthrough 原樣返回。舊版 guard 只看 Look，導致預設
+        // 原色＋特效的組合（新用戶第一次玩特效必中）拍出來完全沒有特效。
         let provider = captureLookProvider
         let keepOriginal = UserDefaults.standard.bool(forKey: "look.keepOriginal")
 
@@ -168,8 +174,15 @@ final class CameraController {
             priority: .userInitiated
         ) { () -> (processed: ProcessedPhoto, lookJPEG: Data?) in
             var lookJPEG: Data?
-            if let recipe = provider?(), recipe.id != LookRecipe.passthrough.id {
+            let recipe = provider?()
+            let effectID = UserDefaults.standard.string(forKey: "effect.selected")
+                ?? EffectRecipe.none.id
+            let effectSelected =
+                (EffectRecipe.byID(effectID)?.id ?? EffectRecipe.none.id) != EffectRecipe.none.id
+            if let recipe, recipe.id != LookRecipe.passthrough.id {
                 lookJPEG = CapturedPhotoProcessor.bakeLook(into: data, recipe: recipe)
+            } else if effectSelected {
+                lookJPEG = CapturedPhotoProcessor.bakeLook(into: data, recipe: LookRecipe.passthrough)
             }
             let processed = CapturedPhotoProcessor.process(lookJPEG ?? data)
             return (processed, lookJPEG)

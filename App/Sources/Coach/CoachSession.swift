@@ -63,6 +63,16 @@
 //    鎖定 haptic／自動抓拍邏輯自然沿用（仍吃 lockState 邊緣）。
 //  - anchorPoint / targetPoint 照舊發布（相容）；UI 改畫準星＋標記屬 A3。
 //
+//  v0.5.0 群組合照（A3）：
+//  - isGroupMode 發布（≥2 臉；FrameAnalyzer 已對第 2 張臉起做信心門檻把關，
+//    此處只看 faces.count）→ A4 據此畫「合照」小字。
+//  - GroupGuard（CoachPipeline.process 內、stabilizer 前）：群組時任一臉框
+//    距畫面四邊 < 3% → 「有人被切到了」（.jointCut, priority 105）硬警告插隊
+//    （AdviceStabilizer priority ≥ 100 立即切換語意自然生效），並取消該帧
+//    自動抓拍；規則層真切關節（110）仍更優先。
+//  - 群組導引語意（錨點 = 整群 union 中心、headroom 以最高臉框頂為準）在
+//    Core TargetSolver（單人路徑 bit-不變，TargetSolverTests 鎖定）。
+//
 //  待真機驗證（發布頻率 ~15fps；facts 屬性只有教練 overlay 應讀取，見檔尾註記）。
 
 import CoreMotion
@@ -116,6 +126,10 @@ final class CoachSession {
     /// true = 模型已載入且最近一次模型分未過期（≤1s）正在混入 displayScore。
     /// 只在值變化時寫入（@Observable 逐屬性追蹤）。
     private(set) var modelActive: Bool = false
+    /// v0.5.0 群組模式（合照）指示：本帧 faces ≥ 2。FrameAnalyzer 已在組 facts
+    /// 時對第 2 張臉起做信心門檻把關 — 這裡只看 count，語意與 union 主體框、
+    /// GroupGuard 完全一致。A4 據此畫「合照」小字。只在值變化時寫入。
+    private(set) var isGroupMode: Bool = false
 
     // MARK: - 內部
 
@@ -261,6 +275,7 @@ final class CoachSession {
             displayScore = 0
             analysisFPS = 0
             modelActive = false
+            isGroupMode = false
             wasLocked = false
         }
     }
@@ -329,6 +344,11 @@ final class CoachSession {
         // 模型參與狀態（少變 → 只在值變化時寫入）
         if output.modelActive != modelActive {
             modelActive = output.modelActive
+        }
+        // v0.5.0 群組模式指示（少變 → 只在值變化時寫入）
+        let group = output.facts.faces.count >= 2
+        if group != isGroupMode {
+            isGroupMode = group
         }
         // 實際 buffer 比例（僅接受直立帧：橫向 = 旋轉未生效，維持前值不畫錯）
         if bufferWidth > 0, bufferHeight >= bufferWidth {
@@ -643,7 +663,8 @@ private final class CoachPipeline {
         // 模型分未過期（≤1s）才參與混合／建議；過期靜默退回純規則
         let modelFresh = lastModelScore01 != nil && facts.timestamp - lastModelAt <= 1.0
 
-        let result = engine.evaluate(facts, config: config)
+        // v0.5.0 GroupGuard 可能取消本帧自動抓拍 → var（見下方注入點）。
+        var result = engine.evaluate(facts, config: config)
         var solved = TargetSolver.solve(facts: facts, result: result)
         // v0.4.0：對準點融合的量測要「未平滑」當帧錨點 — 在 One-Euro 覆寫前
         // 先取原始 solver 輸出（延遲最低；平滑交給 GyroFusedPoint 互補濾波，
@@ -695,6 +716,28 @@ private final class CoachPipeline {
         var candidate = result.advice
         if candidate?.category == .thirds, guidance.target != nil {
             candidate = nil
+        }
+        // v0.5.0 GroupGuard（A3；合照防切人，stabilizer 前 = 契約的「publish 前」）：
+        // 群組（≥2 臉）時任一臉框距畫面四邊 < jointCutEdgeMargin（0.03，契約值）
+        // → 硬警告「有人被切到了」（priority 105 ≥ AdviceStabilizer 硬錯誤門檻
+        // 100 → 立即插隊，不等遲滯）。臉框貼邊看的是「臉」，與規則層 jointCut
+        // 看的膝/踝/腕互補 — 真切到關節（110）比「臉快出框」更嚴重，不覆蓋。
+        // 同帧一併取消自動抓拍（引擎「不自動拍下明顯犯錯構圖」安全網的群組
+        // 延伸；faces.count < 2 完全不進此分支 — 單人路徑不受影響）。
+        if facts.faces.count >= 2 {
+            let margin = config.jointCutEdgeMargin
+            let anyFaceCut = facts.faces.contains { face in
+                face.box.minX < margin || face.box.minY < margin
+                    || face.box.maxX > 1 - margin || face.box.maxY > 1 - margin
+            }
+            if anyFaceCut {
+                result.shouldAutoCapture = false
+                if (candidate?.priority ?? Int.min) < 105 {
+                    candidate = CoachAdvice(
+                        category: .jointCut, message: "有人被切到了", priority: 105
+                    )
+                }
+            }
         }
         // 模型建議（保守；MASTER-PLAN §4.3b）：修正 = −delta、dzoom>0 = 太緊 → 退後。
         // 只在「規則層本帧無話可說、且尚未鎖定」時補位；dzoom 訓練標籤恆 ≥0，

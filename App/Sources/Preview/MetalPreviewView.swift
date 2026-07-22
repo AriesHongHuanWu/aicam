@@ -4,9 +4,17 @@
 //  管線：VideoFrameTap.onPreviewFrame（analysisQueue、~30fps、每帧）
 //    → Coordinator 存最新 buffer（鎖保護、只留 1 顆）
 //    → 主執行緒 setNeedsDisplay（MTKView isPaused + enableSetNeedsDisplay：
-//       按需繪製，draw 一律在主執行緒 → recipeProvider 可安全讀 MainActor 狀態）
-//    → draw：CIImage → LookEngine.apply（passthrough 在 apply 內原樣返回，
-//       零濾鏡成本直畫原帧）→ aspect-fill 變換 → CIContext.render 進 drawable。
+//       按需繪製，draw 一律在主執行緒 → renderProvider 可安全讀 MainActor 狀態）
+//    → draw：CIImage → CachedLookChain（Look 全域；passthrough 原樣返回）
+//       → EffectCompositor.apply（v0.5.0 特效以 mask 分域；none 完全跳過）
+//       → aspect-fill 變換 → CIContext.render 進 drawable。
+//
+//  v0.5.0 特效合成（合成次序鐵律：Look 先全域套用 → effect 以 mask 分域）：
+//  - renderProvider 同時回 (LookRecipe, EffectRecipe)（跨模組契約簽名）。
+//  - effect.id == "none" → 不讀 MaskStore、不進 compositor：特效未啟用零成本。
+//  - MaskStore 是 @MainActor；draw 恆在主執行緒（setNeedsDisplay 走 UIView
+//    顯示週期）→ MainActor.assumeIsolated 同步讀 latestMask（緒錯會 trap，
+//    不會靜默 race）。mask 縮放對齊主影像 extent 由 EffectCompositor 內部處理。
 //
 //  效能設計：
 //  - 目標 30fps（相機出帧率）；重繪由「新帧到達」驅動，無帧不畫、不空轉。
@@ -37,21 +45,22 @@ import UIKit
 struct MetalPreviewView: UIViewRepresentable {
 
     let tap: VideoFrameTap
-    let recipeProvider: () -> LookRecipe
+    /// 每帧渲染參數：(Look, Effect)。draw 恆在主執行緒呼叫（v0.5.0 契約簽名）。
+    let renderProvider: () -> (LookRecipe, EffectRecipe)
     let onFailure: () -> Void
 
     init(
         tap: VideoFrameTap,
-        recipeProvider: @escaping () -> LookRecipe,
+        renderProvider: @escaping () -> (LookRecipe, EffectRecipe),
         onFailure: @escaping () -> Void
     ) {
         self.tap = tap
-        self.recipeProvider = recipeProvider
+        self.renderProvider = renderProvider
         self.onFailure = onFailure
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(tap: tap, recipeProvider: recipeProvider, onFailure: onFailure)
+        Coordinator(tap: tap, renderProvider: renderProvider, onFailure: onFailure)
     }
 
     func makeUIView(context: Context) -> MTKView {
@@ -90,7 +99,7 @@ struct MetalPreviewView: UIViewRepresentable {
     final class Coordinator: NSObject, MTKViewDelegate {
 
         private let tap: VideoFrameTap
-        private let recipeProvider: () -> LookRecipe
+        private let renderProvider: () -> (LookRecipe, EffectRecipe)
         private let onFailure: () -> Void
 
         private var ciContext: CIContext?
@@ -113,11 +122,11 @@ struct MetalPreviewView: UIViewRepresentable {
 
         init(
             tap: VideoFrameTap,
-            recipeProvider: @escaping () -> LookRecipe,
+            renderProvider: @escaping () -> (LookRecipe, EffectRecipe),
             onFailure: @escaping () -> Void
         ) {
             self.tap = tap
-            self.recipeProvider = recipeProvider
+            self.renderProvider = renderProvider
             self.onFailure = onFailure
             super.init()
         }
@@ -193,10 +202,42 @@ struct MetalPreviewView: UIViewRepresentable {
                 )
             }
 
-            // 套 Look（passthrough 在 apply 內原樣返回 → 直畫原帧）；
-            // draw 在主執行緒 → recipeProvider 可安全讀 MainActor / @Observable 狀態。
-            // 走 CachedLookChain：與 LookEngine.apply 同語意，filter 依 recipe.id 重用
-            image = lookChain.apply(recipeProvider(), to: image)
+            // 合成次序鐵律（v0.5.0）：Look 先全域套用 → effect 以 mask 分域。
+            // draw 在主執行緒 → renderProvider 可安全讀 MainActor / @Observable 狀態。
+            // Look 走 CachedLookChain：與 LookEngine.apply 同語意，filter 依 recipe.id 重用
+            let (look, effect) = renderProvider()
+            image = lookChain.apply(look, to: image)
+
+            // 特效（v0.5.0）：none 完全跳過 — 不讀 MaskStore、不進 compositor，
+            // 特效未啟用時本段零成本（守恆契約）。
+            if effect.id != EffectRecipe.none.id {
+                // MaskStore 是 @MainActor；draw 由 setNeedsDisplay 驅動、恆在
+                // 主執行緒（MTKView isPaused + enableSetNeedsDisplay 走 UIView
+                // 顯示週期）→ assumeIsolated 是同步且正確的讀法。閉包回傳 Void，
+                // 快照經捕獲變數帶出（避免泛型回傳的 Sendable 約束疑慮）。
+                var maskBuffer: CVPixelBuffer?
+                MainActor.assumeIsolated {
+                    // 時效判定（v0.5.0 修正輪）：分割一停（模式／開關切換）
+                    // MaskStore 沒有渲染端可及的清空路徑（publishMaskClear 只在
+                    // 分析 queue 執行）→ 不設防會拿凍結舊 mask 合成，鏡頭一動
+                    // 特效分域永久錯位。>0.5s 未更新視為無 mask（needsMask 特效
+                    // 回原圖 — 比錯位合成誠實）。publishedAt 為 systemUptime，
+                    // 與此處同時基直接相減。
+                    let store = MaskStore.shared
+                    if let mask = store.latestMask,
+                       ProcessInfo.processInfo.systemUptime - store.publishedAt <= 0.5 {
+                        maskBuffer = mask
+                    }
+                }
+                // mask CVPixelBuffer → CIImage；縮放對齊主影像 extent 由
+                // EffectCompositor.apply 內部處理（跨模組契約）。
+                // mask nil 且 effect 需要 mask → apply 回原圖（同契約）。
+                image = EffectCompositor.apply(
+                    effect,
+                    to: image,
+                    mask: maskBuffer.map { CIImage(cvPixelBuffer: $0) }
+                )
+            }
 
             // aspect-fill 縮放：取兩軸放大比的「較大者」→ 短邊貼齊 drawable、
             // 長邊超出，置中後由 render bounds 裁掉超出部分（與

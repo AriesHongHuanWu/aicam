@@ -169,6 +169,15 @@ final class VideoFrameTap: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         // 不在此 queue 做任何濾鏡運算。
         previewCallback?(pixelBuffer)
 
+        // v0.5.0 修正輪：分割不能只綁教練分析 — 拍照等模式（active=false）選了
+        // 特效時，Metal 取景器仍要有 mask 才能畫即時特效。只在「有預覽消費者」
+        // （previewCallback 非 nil = Metal 取景器正在收帧）時跑；特效開關／
+        // look.livePreview／熱降級／0.15s 節流守門全在 analyzer 內（同
+        // analysisQueue，狀態不跨執行緒）。教練啟用時走 analyze 內的既有節奏。
+        if !active, previewCallback != nil {
+            analyzer.runStandaloneSegmentationIfDue(pixelBuffer: pixelBuffer, timestamp: timestamp)
+        }
+
         // 節流：未啟用／分析中（同 queue 理論上不會發生，防禦用）／距上次分析 < interval → 丟帧
         guard active, !isBusy, timestamp - lastAnalysisTime >= interval else { return }
         isBusy = true

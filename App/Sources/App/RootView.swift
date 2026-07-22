@@ -22,6 +22,15 @@
 //    的帧流由 updatePreviewFrameFlow 依可見性開關（與教練需求在 camera 端仲裁）；
 //    AIControlCenter.shared.camera 於 .task 接線。
 //
+//  v0.5.0「分割特效引擎」UI 整合：
+//  - MetalPreviewView 改 renderProvider 契約簽名：同時回 (LookRecipe, EffectRecipe)；
+//    effect.liveEnabled 關閉或選「無」→ 回 EffectRecipe.none（取景器零特效成本，
+//    拍攝烘焙不受影響 — 烘焙管線自讀 effect.selected）。
+//  - 特效列（EffectBar）：Look 列下方膠囊 chips（無/跳色/虛化/聚光/雙色調），
+//    只在拍照/教練模式顯示；選非 none 且 MaskStore 連續 >2s 無 mask →
+//    選中 chip 小警示點 + toast 一次「畫面中未偵測到人物」。
+//  - 合照小標（GroupModeBadge）：≥2 臉（與 A3 群組構圖同判準）時取景器上緣灰字。
+//
 //  既有（v0.2.1，不可破壞）：快門白閃、細膩黑漸層、權限提示頁、教練接線、導演。
 
 import AICamCore
@@ -42,7 +51,11 @@ struct RootView: View {
     @AppStorage("look.selected") private var selectedLookID = "none"
     /// AI 自動選 Look（跨模組契約 key；預設 false）。
     @AppStorage("look.autoApply") private var lookAutoApply = false
+    /// 目前選中特效的 id（v0.5.0 跨模組契約 key；"none" = 無特效）。
+    @AppStorage("effect.selected") private var selectedEffectID = "none"
     @State private var isSettingsPresented = false
+    /// 「畫面中未偵測到人物」toast 顯示中（EffectBar 無 mask 偵測觸發，一次性）。
+    @State private var noSubjectToastVisible = false
     /// 快門擊發白閃疊層透明度。
     @State private var shutterFlashOpacity: Double = 0
     /// Metal 預覽本次啟動失敗 → fallback 到 PreviewLayerView。
@@ -64,7 +77,9 @@ struct RootView: View {
                     if lookLivePreview && !metalFailed {
                         MetalPreviewView(
                             tap: camera.videoTap,
-                            recipeProvider: { Self.currentPreviewRecipe() },
+                            renderProvider: {
+                                (Self.currentPreviewRecipe(), Self.currentPreviewEffect())
+                            },
                             onFailure: {
                                 // 可能自渲染執行緒回呼 → hop 回 MainActor 再改 @State
                                 Task { @MainActor in
@@ -101,6 +116,12 @@ struct RootView: View {
                 LookSuggestionFeeder(session: coach)
                 CoachHUD(session: coach)
                     .allowsHitTesting(false)
+                // 合照小標（v0.5.0）：≥2 臉時取景器上緣置中灰字。
+                // facts 只在教練模式發布 → 其他模式自動隱藏，不需 mode 判斷。
+                GroupModeBadge(session: coach)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                    .padding(.top, 56)
+                    .allowsHitTesting(false)
             }
 
             VStack(spacing: 0) {
@@ -134,6 +155,19 @@ struct RootView: View {
                 AIControlToast()
                     .padding(.horizontal, 24)
                     .padding(.bottom, 4)
+
+                // 特效無人物警示 toast（v0.5.0；showNoSubjectToast 觸發、自動淡出）。
+                if noSubjectToastVisible {
+                    Text("畫面中未偵測到人物")
+                        .font(Tokens.label(13))
+                        .foregroundStyle(Tokens.gray1)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .dsGlassCapsule()
+                        .padding(.bottom, 4)
+                        .allowsHitTesting(false)
+                        .transition(.scale(scale: 0.9).combined(with: .opacity))
+                }
 
                 controls
             }
@@ -213,10 +247,20 @@ struct RootView: View {
 
     private var controls: some View {
         VStack(spacing: 16) {
-            // Look 選擇列：拍照＋教練模式，鏡頭列上方（v0.3.0）。
+            // Look 選擇列＋特效列：拍照＋教練模式，鏡頭列上方（v0.3.0 / v0.5.0）。
             if mode == .photo || mode == .coach {
-                LookBar(selectedID: $selectedLookID) {
-                    lastManualLookAt = Date()
+                VStack(spacing: 8) {
+                    LookBar(selectedID: $selectedLookID) {
+                        lastManualLookAt = Date()
+                    }
+                    EffectBar(
+                        selectedID: $selectedEffectID,
+                        // Metal 取景器可見才可能有即時 mask（FrameAnalyzer 分割
+                        // 守門同判準）— 不可見時監測必須停，否則必然誤報。
+                        masksExpected: lookLivePreview && !metalFailed
+                    ) {
+                        showNoSubjectToast()
+                    }
                 }
                 .transition(.opacity)
             }
@@ -261,7 +305,7 @@ struct RootView: View {
     // MARK: - Look（v0.3.0）
 
     /// AppStorage "look.selected" 目前值（任意執行緒；UserDefaults 執行緒安全）。
-    /// Metal recipeProvider / captureLookProvider 都在背景 queue 呼叫 →
+    /// Metal renderProvider / captureLookProvider 可能在 view 外／背景 queue 呼叫 →
     /// 不經 @AppStorage wrapper（view 外讀取語意未定義），直讀 UserDefaults。
     nonisolated private static func selectedRecipeID() -> String {
         UserDefaults.standard.string(forKey: "look.selected") ?? LookRecipe.passthrough.id
@@ -277,6 +321,34 @@ struct RootView: View {
     nonisolated private static func currentCaptureLook() -> LookRecipe? {
         let recipe = currentPreviewRecipe()
         return recipe.id == LookRecipe.passthrough.id ? nil : recipe
+    }
+
+    // MARK: - 特效（v0.5.0）
+
+    /// renderProvider 的 effect 端（任意執行緒；直讀 UserDefaults，理由同上）。
+    /// effect.liveEnabled 關閉 → 取景器一律回 none（特效僅在拍攝成品套用；
+    /// 烘焙管線自讀 effect.selected，不經本函式）。@AppStorage 宣告的預設值
+    /// 不會寫入 UserDefaults → 以 object(forKey:) 判「無值」套預設 true。
+    nonisolated private static func currentPreviewEffect() -> EffectRecipe {
+        let liveEnabled =
+            UserDefaults.standard.object(forKey: "effect.liveEnabled") as? Bool ?? true
+        guard liveEnabled else { return EffectRecipe.none }
+        let id = UserDefaults.standard.string(forKey: "effect.selected") ?? EffectRecipe.none.id
+        return EffectRecipe.all.first { $0.id == id } ?? EffectRecipe.none
+    }
+
+    /// 顯示「畫面中未偵測到人物」toast（2.5s 後自動淡出；顯示中不重複觸發）。
+    private func showNoSubjectToast() {
+        guard !noSubjectToastVisible else { return }
+        withAnimation(Tokens.springAppear) {
+            noSubjectToastVisible = true
+        }
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(2.5))
+            withAnimation(Tokens.springAppear) {
+                noSubjectToastVisible = false
+            }
+        }
     }
 
     /// look.autoApply 開時每 5s 呼叫：自動切到推薦 top-1。
@@ -493,6 +565,146 @@ private struct LookBar: View {
         .buttonStyle(.plain)
         .animation(Tokens.springFast, value: isSelected)
         .accessibilityLabel("濾鏡 \(recipe.name)")
+    }
+}
+
+// MARK: - 特效選擇列（A4；v0.5.0；只在拍照/教練模式顯示）
+
+/// 橫向膠囊 chips：「無」＋跳色/虛化/聚光/雙色調（EffectRecipe.all，名稱來自配方）。
+/// 選中＝白底黑字＋selection haptic（與 LookBar 同視覺語言）。
+/// 選非 none 且 MaskStore 連續 >2s 無 mask → 選中 chip 右上小警示點（白底上黑點）、
+/// 並經 onNoSubject 回呼 toast 一次（每次選擇最多一次；mask 出現即清警示）。
+@MainActor
+private struct EffectBar: View {
+    @Binding var selectedID: String
+    /// Metal 取景器可見（look.livePreview 開且未失敗）→ 分割管線才會產 mask
+    /// （v0.5.0 修正輪；RootView 傳入）。false 時無 mask 是設計而非「沒偵測到
+    /// 人物」→ 監測停跑。
+    let masksExpected: Bool
+    /// 無 mask 警示回呼（RootView 顯示「畫面中未偵測到人物」toast）。
+    let onNoSubject: () -> Void
+
+    /// 即時特效預覽開關：關閉時 FrameAnalyzer 不產 mask（設計如此，非「沒偵測到
+    /// 人物」）→ 監測必須一併停掉，否則必然誤報 toast。
+    @AppStorage("effect.liveEnabled") private var effectLiveEnabled = true
+
+    /// 無 mask 警示點顯示中。
+    @State private var noMaskWarning = false
+    /// 本次選擇是否已 toast 過（契約：toast 一次）。
+    @State private var hasToasted = false
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(EffectRecipe.all) { recipe in
+                    chip(recipe)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 2)
+        }
+        // 無 mask 監測：每 1s 輪詢 MaskStore（@MainActor，本 view 同 actor 直讀）。
+        // 選「無」、即時特效預覽關閉、或 Metal 取景器不可見（masksExpected=false）
+        // 時整個 task 直接 return — 零輪詢成本（守恆契約）且不誤報；
+        // 離開拍照/教練模式（view 卸載）、換選擇或切開關時 task 自動取消重建。
+        .task(id: "\(selectedID)|\(effectLiveEnabled)|\(masksExpected)") {
+            noMaskWarning = false
+            hasToasted = false
+            guard selectedID != EffectRecipe.none.id, effectLiveEnabled, masksExpected else {
+                return
+            }
+            // 以「最後一次看到 mask」為基準；選擇時刻起算 → 至少 2s 後才可能警示。
+            var lastMaskSeen = Date()
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                if MaskStore.shared.latestMask != nil {
+                    lastMaskSeen = Date()
+                }
+                let noMask = Date().timeIntervalSince(lastMaskSeen) > 2
+                if noMask != noMaskWarning {
+                    withAnimation(Tokens.springAppear) {
+                        noMaskWarning = noMask
+                    }
+                }
+                if noMask, !hasToasted {
+                    hasToasted = true
+                    onNoSubject()
+                }
+            }
+        }
+    }
+
+    private func chip(_ recipe: EffectRecipe) -> some View {
+        let isSelected = recipe.id == selectedID
+        return Button {
+            guard !isSelected else { return }
+            UISelectionFeedbackGenerator().selectionChanged()
+            withAnimation(Tokens.springFast) {
+                selectedID = recipe.id
+            }
+        } label: {
+            Text(recipe.name)
+                .font(Tokens.label(12, weight: isSelected ? .semibold : .regular))
+                .foregroundStyle(isSelected ? Tokens.bg : Tokens.fg)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 5)
+                .background {
+                    if isSelected {
+                        Capsule().fill(Tokens.fg)
+                    } else {
+                        Capsule()
+                            .fill(.ultraThinMaterial)
+                            .environment(\.colorScheme, .dark)
+                    }
+                }
+                .overlay(
+                    Capsule().strokeBorder(
+                        isSelected ? Color.clear : Tokens.glassHairline,
+                        lineWidth: Tokens.hairline
+                    )
+                )
+                .overlay(alignment: .topTrailing) {
+                    // 無 mask 警示點：只畫在選中的非 none chip 上；
+                    // 白底 → 黑點內縮才可見（懸出邊界的部分會沒入黑背景）。
+                    if isSelected, noMaskWarning, recipe.id != EffectRecipe.none.id {
+                        Circle()
+                            .fill(Tokens.bg)
+                            .frame(width: 5, height: 5)
+                            .offset(x: -3, y: 3)
+                            .transition(.opacity)
+                    }
+                }
+                .shadow(color: Tokens.softShadow, radius: 8, x: 0, y: 2)
+        }
+        .buttonStyle(.plain)
+        .animation(Tokens.springFast, value: isSelected)
+        .accessibilityLabel("特效 \(recipe.name)")
+    }
+}
+
+// MARK: - 合照小標（v0.5.0；≥2 臉 = 群組構圖，取景器上緣灰字）
+
+/// 「合照」灰字小標：session.isGroupMode（CoachSession 專為本 view 發布的
+/// 低頻 surface — 只在值變化時寫入，判準 = facts.faces.count >= 2、與 A3 群組
+/// 構圖單一來源；v0.5.0 修正輪：原直讀 facts 逐帧 diff ~15fps，白付效能且
+/// 判準重複兩處）。isGroupMode 只在教練模式發布（setActive(false) 清 false）
+/// → 其他模式自動隱藏。
+@MainActor
+private struct GroupModeBadge: View {
+    let session: CoachSession
+
+    var body: some View {
+        let isGroup = session.isGroupMode
+        ZStack {
+            if isGroup {
+                Text("合照")
+                    .font(Tokens.label(11, weight: .medium))
+                    .foregroundStyle(Tokens.gray2)
+                    .shadow(color: Color.black.opacity(0.5), radius: 2)
+                    .transition(.opacity)
+            }
+        }
+        .animation(Tokens.springAppear, value: isGroup)
     }
 }
 

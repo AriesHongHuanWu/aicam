@@ -282,4 +282,81 @@ final class TargetSolverTests: XCTestCase {
         XCTAssertNil(g.cameraMoveHint)
         XCTAssertEqual(g.lockState, LockState.searching)
     }
+
+    // MARK: - v0.5.0 群組合照（≥2 臉 + 整群 union subjectBox）
+
+    func testGroupAnchorIsUnionSubjectCenter() throws {
+        // 群組：臉 A (0.10, 0.30, 0.16, 0.20)（面積 0.032）、
+        // 臉 B (0.60, 0.20, 0.20, 0.25)（面積 0.050 = 最大）。
+        // App 層 union subjectBox = (0.05, 0.15, 0.80, 0.45)
+        // → anchor = 整群中心 (0.45, 0.375)，「不再是」最大臉中心 (0.70, 0.325)。
+        // x：無 yaw → 就近三分線：|0.45 − 1/3| = 0.1167 < |0.45 − 2/3| = 0.2167 → 1/3。
+        // y：最高臉頂 topY = min(0.30, 0.20) = 0.20 → δ = 0.085 − 0.20 = −0.115
+        //    → target.y = 0.375 − 0.115 = 0.26。
+        let facts = FrameFacts(
+            faces: [
+                FaceFact(box: NRect(x: 0.10, y: 0.30, width: 0.16, height: 0.20)),
+                FaceFact(box: NRect(x: 0.60, y: 0.20, width: 0.20, height: 0.25))
+            ],
+            subjectBox: NRect(x: 0.05, y: 0.15, width: 0.80, height: 0.45)
+        )
+        let g = TargetSolver.solve(facts: facts, result: result(.halfBody))
+
+        let anchor = try XCTUnwrap(g.anchor)
+        XCTAssertEqual(anchor.x, 0.45, accuracy: 1e-12)
+        XCTAssertEqual(anchor.y, 0.375, accuracy: 1e-12)
+        let target = try XCTUnwrap(g.target)
+        XCTAssertEqual(target.x, 1.0 / 3.0, accuracy: 1e-9)
+        XCTAssertEqual(target.y, 0.26, accuracy: 1e-9)
+    }
+
+    func testGroupHeadroomUsesHighestFaceTopNotPrimary() throws {
+        // 最大臉 B (0.55, 0.30, 0.24, 0.30)（minY = 0.30）、
+        // 較小但站得更高的臉 A (0.15, 0.10, 0.10, 0.12)（minY = 0.10 = 最高臉頂）。
+        // union subjectBox = (0.10, 0.05, 0.75, 0.60) → anchor = (0.475, 0.35)。
+        // topY = 0.10 → δ = 0.085 − 0.10 = −0.015 → target.y = 0.35 − 0.015 = 0.335。
+        // 若誤用最大臉 minY = 0.30：δ = −0.215 → target.y = 0.135 —
+        // 整群被抬到爆掉 A 的頭（本測試就是鎖死這個錯誤不得回歸）。
+        let facts = FrameFacts(
+            faces: [
+                FaceFact(box: NRect(x: 0.55, y: 0.30, width: 0.24, height: 0.30)),
+                FaceFact(box: NRect(x: 0.15, y: 0.10, width: 0.10, height: 0.12))
+            ],
+            subjectBox: NRect(x: 0.10, y: 0.05, width: 0.75, height: 0.60)
+        )
+        let g = TargetSolver.solve(facts: facts, result: result(.halfBody))
+        XCTAssertEqual(try XCTUnwrap(g.target).y, 0.335, accuracy: 1e-9)
+    }
+
+    func testGroupFullBodyClampUsesHighestFaceTop() throws {
+        // 群組全身：臉 A (0.15, 0.08, 0.10, 0.12)（minY = 0.08 = 最高）、
+        // 最大臉 B (0.55, 0.20, 0.20, 0.25)（minY = 0.20）。
+        // union subjectBox = (0.10, 0.05, 0.80, 0.80) → midY = 0.45、
+        // anchor = 整群中心 (0.50, 0.45)。
+        // δ₀ = 0.5 − 0.45 = 0.05；clamp 以最高臉頂：[0.05 − 0.08, 0.12 − 0.08]
+        // = [−0.03, 0.04] → δ = 0.04 → target.y = 0.45 + 0.04 = 0.49。
+        // 若誤用最大臉 minY = 0.20：上限 = −0.08 → target.y = 0.37。
+        let facts = FrameFacts(
+            faces: [
+                FaceFact(box: NRect(x: 0.15, y: 0.08, width: 0.10, height: 0.12)),
+                FaceFact(box: NRect(x: 0.55, y: 0.20, width: 0.20, height: 0.25))
+            ],
+            subjectBox: NRect(x: 0.10, y: 0.05, width: 0.80, height: 0.80)
+        )
+        let g = TargetSolver.solve(facts: facts, result: result(.fullBody))
+        XCTAssertEqual(try XCTUnwrap(g.target).y, 0.49, accuracy: 1e-9)
+    }
+
+    func testGroupWithoutUnionSubjectFallsBackToLargestFace() throws {
+        // 防禦：≥2 臉但 subjectBox = nil（上游未組 union）→ 群組分支的 guard
+        // 不成立 → 錨點退回最大臉中心（= testLargestFaceWins 的舊多人行為）。
+        let facts = FrameFacts(faces: [
+            FaceFact(box: NRect(x: 0.1, y: 0.25, width: 0.08, height: 0.10)),
+            FaceFact(box: NRect(x: 0.52, y: 0.15, width: 0.24, height: 0.30))
+        ])
+        let g = TargetSolver.solve(facts: facts, result: result(.closeUp))
+        let anchor = try XCTUnwrap(g.anchor)
+        XCTAssertEqual(anchor.x, 0.64, accuracy: 1e-12)
+        XCTAssertEqual(anchor.y, 0.30, accuracy: 1e-12)
+    }
 }

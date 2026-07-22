@@ -7,7 +7,8 @@
 //
 //  P0 流程：didFinishProcessingPhoto 取 fileDataRepresentation()（HEIF 或 JPEG）
 //  → didFinishCaptureFor 收尾，把 data 交回 completion（保證恰好呼叫一次）。
-//  後續（存相簿 / 縮圖 / 1280px JPEG / v0.3.0 Look 烘焙）由 CameraController 統籌。
+//  後續（存相簿 / 縮圖 / 1280px JPEG / v0.3.0 Look 烘焙 / v0.5.0 特效烘焙）
+//  由 CameraController 統籌。
 
 import AVFoundation
 import UIKit
@@ -71,12 +72,44 @@ enum CapturedPhotoProcessor {
         )
     }
 
-    /// Look 烘焙（v0.3.0）：原始拍照 data（HEIF/JPEG）→ 帶 Look 的 JPEG。
-    /// quality 0.92（存相簿等級）；失敗回 nil，呼叫端 fallback 存原檔。
-    /// 任意背景執行緒可呼叫（LookEngine.renderJPEG 為純函式語意）。
-    /// 呼叫端（CameraController.capturePhoto）已保證 recipe 非 passthrough。
+    /// Look＋特效烘焙（v0.3.0 Look；v0.5.0 擴充分割特效）：
+    /// 原始拍照 data（HEIF/JPEG）→ 帶 Look（＋特效）的 JPEG。
+    /// quality 0.92（存相簿等級）；失敗回 nil，呼叫端 fallback 存原檔（照片永不丟失）。
+    /// recipe 可為 passthrough（v0.5.0 修正輪：Look=原色但特效已選的組合 —
+    /// LookEngine 對 passthrough 原樣返回，特效照套）；
+    /// keepOriginal 邏輯不在本層 — 呼叫端依回傳值沿用既有存檔分支。
+    ///
+    /// 特效選擇讀 UserDefaults "effect.selected"（與 AppStorage 同 key；
+    /// 未設定或未知 id 一律視為「無」）：
+    /// - 特效 = 無 → 走既有 LookEngine.renderJPEG，行為與 v0.3.0 完全相同
+    ///   （不建 SegmentationEngine、不跑分割 — 特效未啟用零成本鐵律）。
+    /// - 特效 ≠ 無 → EffectCompositor.bake（合成次序鐵律：Look 先全域 →
+    ///   特效以 mask 分域）；mask 由 SegmentationEngine.accurateMask 供應
+    ///   （.accurate 人像分割，無人時 iOS 17 任意主體 fallback；再無 mask →
+    ///   bake 內只落 Look，特效靜默略過）。
+    ///
+    /// 效能：本函式恆在拍照處理背景 queue（CameraController.capturePhoto 的
+    /// Task.detached）執行，特效路徑含 .accurate 分割 ~1–2s（契約允許）。
+    /// 執行緒：無共享可變狀態；SegmentationEngine 每次烘焙新建（一次性
+    /// .accurate request，非逐帧路徑，重用無收益）。
     static func bakeLook(into data: Data, recipe: LookRecipe) -> Data? {
-        LookEngine.renderJPEG(from: data, recipe: recipe, quality: 0.92)
+        let effectID = UserDefaults.standard.string(forKey: "effect.selected")
+            ?? EffectRecipe.none.id
+        guard let effect = EffectRecipe.byID(effectID),
+              effect.id != EffectRecipe.none.id
+        else {
+            // 特效未啟用（或未知 id 防呆）：與 v0.3.0 完全同路徑、零額外成本。
+            return LookEngine.renderJPEG(from: data, recipe: recipe, quality: 0.92)
+        }
+        // 特效烘焙失敗（解碼/輸出錯誤）→ 降級試純 Look；再失敗回 nil =
+        // 呼叫端存原檔（既有 fallback 鏈不變，照片永不丟失）。
+        return EffectCompositor.bake(
+            jpeg: data,
+            look: recipe,
+            effect: effect,
+            maskProvider: { SegmentationEngine().accurateMask(forJPEG: data) },
+            quality: 0.92
+        ) ?? LookEngine.renderJPEG(from: data, recipe: recipe, quality: 0.92)
     }
 
     /// 等比縮到長邊 = longestSide（原圖較小則原尺寸重繪）。
