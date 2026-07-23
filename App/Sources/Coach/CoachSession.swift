@@ -73,6 +73,22 @@
 //  - 群組導引語意（錨點 = 整群 union 中心、headroom 以最高臉框頂為準）在
 //    Core TargetSolver（單人路徑 bit-不變，TargetSolverTests 鎖定）。
 //
+//  v0.5.1 對準標記「跟手飄」緊急修復（本檔 = App 接線端；數學在 Core AimPoint.swift）：
+//  真機回饋：鏡頭對準時標記一直往移動方向飄走。三個共症一次免疫：
+//  (a) 某軸陀螺儀符號實機相反（紙上推導自洽但未實證）／(b) FOV/變焦換算殘差
+//      → 增益過低、標記跟不上景物（視覺 = 黏著螢幕跟手走）：GyroFusedPoint
+//      AutoGain 逐軸線上學增益 — 符號反收斂到負值自動翻號、增益低收斂 >1
+//      補償（自癒）；學得值以 UserDefaults 持久化、前後鏡各一組
+//      （aim.gain.{x,y}.{back,front}；存取順序鐵律見 resetGuidance）。
+//  (c) Vision 量測延遲 100–200ms：舊版 correct 把融合值往「舊帧位置」（恆在
+//      用戶移動方向後方）拖，15fps×0.35 的回拖速率與陀螺儀前進速率同量級
+//      ⇒ 移動中標記像被手拖著走：改 correct(marker, measuredAt:
+//      facts.timestamp) 延遲補償 — Core 回溯環形緩衝在「帧時間」上算
+//      innovation（時基一致性論證＋1.0s 防禦退化 guard 見
+//      AimFusionCoordinator.correct）。
+//  predict 帶 CMDeviceMotion.timestamp（= 回溯緩衝時間軸）；其餘行為
+//  （黏性目標／tracker／發布節奏）一律不動。
+//
 //  待真機驗證（發布頻率 ~15fps；facts 屬性只有教練 overlay 應讀取，見檔尾註記）。
 
 import CoreMotion
@@ -178,6 +194,10 @@ final class CoachSession {
     /// 融合器 reset + 以新量測 pass-through 重播 — 標記「跳切」到新靶
     ///（換靶是刻意動作，跳切明確傳達「新目標」；不從舊靶滑過去）。
     @ObservationIgnored private var lastAimTarget: NPoint?
+    /// v0.5.1：融合器內「目前增益」所屬鏡位（true = 前鏡）；nil = 尚未 seed。
+    /// 翻鏡回呼（onCameraReconfigured）觸發時 camera.isFront 已是「新」鏡位 —
+    /// 舊鏡位增益要落盤到哪組 key 只有這裡記得（resetGuidance 存取順序鐵律）。
+    @ObservationIgnored private var aimGainsIsFront: Bool?
 
     init(camera: CameraController) {
         self.camera = camera
@@ -293,9 +313,22 @@ final class CoachSession {
         alignDistance = nil
         wasLocked = false
         // v0.4.0：取景座標跳變 → 融合器清空（GyroFusedPoint value 歸 nil 後
-        // predict 靜默忽略 — 新座標空間的首筆 correct pass-through 前，
+        // predict 不動 value — 新座標空間的首筆 correct pass-through 前，
         // 舊符號／舊 FOV 的陀螺儀預測「不可能」污染標記）+ 標記立即熄滅。
+        // v0.5.1 翻鏡增益存取順序（鐵律）：本回呼在相機重配「完成後」觸發 —
+        // camera.isFront 已是「新」鏡位，舊鏡位只有 aimGainsIsFront 記得：
+        // (1) 先把目前增益存到「舊」鏡位 key（在 reset 前；Core 契約 reset
+        //     不清增益，但「先存再動」是唯一不依賴該細節的順序）；
+        // (2) aimFusion.reset()（清 value／回溯緩衝／AutoGain 量測基準）；
+        // (3) seed「新」鏡位增益（無值 1.0）並更新 aimGainsIsFront。
+        // 同鏡位鏡頭切換（如後鏡 1x↔3x）三步同樣執行：存後 seed 回同組 key，
+        // 語意 = 學得值即時落盤一次，無害。教練未啟用時本回呼仍會執行 —
+        // 增益是跨啟用會期的持久狀態，照存照 seed（motion 停著、無新學習）。
+        if let oldIsFront = aimGainsIsFront {
+            saveAimGains(isFront: oldIsFront)
+        }
         aimFusion.reset()
+        seedAimGains(isFront: camera.isFront)
         lastAimTarget = nil
         aim = nil
         aimDistance = nil
@@ -349,6 +382,14 @@ final class CoachSession {
         let group = output.facts.faces.count >= 2
         if group != isGroupMode {
             isGroupMode = group
+            // v0.5.1 AutoGain 防護：臉數跨 2 邊緣 = TargetSolver 錨點定義跳變
+            // （單人錨點 ↔ 群組 union 中心）。target 若未變（planner 凍結中、
+            // 呼叫端不 reset），跳變會全額進本帧 correct 的 measDelta —
+            // 只清增益學習基準（跳過一筆學習），value／緩衝／增益不動，
+            // 標記連續性不受影響。本行在 updateAimFusion「之前」執行（下方）
+            // 才擋得到本帧；target 同帧也變了則 updateAimFusion 的 reset
+            // 涵蓋此清除，重複無害。
+            aimFusion.invalidateGainBaseline()
         }
         // 實際 buffer 比例（僅接受直立帧：橫向 = 旋轉未生效，維持前值不畫錯）
         if bufferWidth > 0, bufferHeight >= bufferWidth {
@@ -358,11 +399,13 @@ final class CoachSession {
             }
         }
 
-        // v0.4.0：對準點融合 Vision 修正步（量測 = 未平滑錨點 × 凍結目標）
+        // v0.4.0：對準點融合 Vision 修正步（量測 = 未平滑錨點 × 凍結目標）；
+        // v0.5.1：帶帧 PTS 時間（facts.timestamp）給延遲補償版 correct。
         updateAimFusion(
             guidance: output.guidance,
             rawAnchor: output.rawAnchor,
-            isFront: output.facts.isFrontCamera
+            isFront: output.facts.isFrontCamera,
+            frameTime: output.facts.timestamp
         )
 
         // 鎖定轉變邊緣觸發一次 haptic（success）
@@ -393,9 +436,13 @@ final class CoachSession {
 
     // MARK: - 對準點導引（v0.4.0）
 
-    /// 教練啟用：刷新 FOV 快取 → 啟動 100Hz gyro → 啟動 ~60Hz 發布 timer。
+    /// 教練啟用：刷新 FOV 快取 → seed 持久化增益 → 啟動 100Hz gyro →
+    /// 啟動 ~60Hz 發布 timer。
     private func startAimUpdates() {
         refreshAimProjection()
+        // v0.5.1：恢復本鏡位上次學得的增益（無值 1.0）。在 startMotion 前 —
+        // 首筆 predict 起即帶上次收斂的增益／符號，不必每次進教練模式重學。
+        seedAimGains(isFront: camera.isFront)
         aimFusion.resetMotionClock()
         if aimMotionManager.isDeviceMotionAvailable, !aimMotionManager.isDeviceMotionActive {
             // 契約：interval 提到 1/100（Vision ~15fps 之間標記靠這裡推算）。
@@ -429,11 +476,16 @@ final class CoachSession {
         aimPublishTimer = timer
     }
 
-    /// 教練停用：gyro／timer 全停 + 融合器清空 + 發布熄滅。
+    /// 教練停用：gyro／timer 全停 + 學得增益落盤（v0.5.1）+ 融合器清空 + 發布熄滅。
     private func stopAimUpdates() {
         aimMotionManager.stopDeviceMotionUpdates()
         aimPublishTimer?.invalidate()
         aimPublishTimer = nil
+        // v0.5.1：先落盤再 reset（Core 契約 reset 不清增益，但「先存再動」
+        // 是唯一不依賴該細節的順序 — 與 resetGuidance 同鐵律）。
+        if let isFront = aimGainsIsFront {
+            saveAimGains(isFront: isFront)
+        }
         aimFusion.reset()
         lastAimTarget = nil
         aim = nil
@@ -450,6 +502,15 @@ final class CoachSession {
         // 鏡位切換另有 onCameraReconfigured → resetGuidance 立即清融合器）
         if aimTickCount % 60 == 1 {
             refreshAimProjection()
+            // v0.5.1：學得增益順帶落盤（~1s 一次；UserDefaults set 為記憶體
+            // 操作，成本可忽略）— 只靠 stopAimUpdates / resetGuidance 落盤的話，
+            // 教練進行中被系統終止／crash／用戶上滑殺 app 會丟掉本次收斂的
+            // 符號與增益，下次啟動從舊值重播 ~1.3s（20 筆 × 66ms）跟手飄
+            // 過渡期。isFront 必用 aimGainsIsFront（增益「所屬」鏡位），
+            // 與 saveAimGains 契約一致。
+            if let isFront = aimGainsIsFront {
+                saveAimGains(isFront: isFront)
+            }
         }
         guard let marker = aimFusion.value else {
             if aim != nil { aim = nil }
@@ -516,7 +577,20 @@ final class CoachSession {
     /// - 換靶（凍結 target 變了 = planner 重新承諾）→ reset 後 correct
     ///   pass-through：標記「跳切」到新靶（刻意；互補濾波從舊靶滑過去 ~0.5s
     ///   會讓 tracker 距離短暫失真，跳切同時明確傳達「新目標」）。
-    private func updateAimFusion(guidance: TargetGuidance, rawAnchor: NPoint?, isFront: Bool) {
+    ///
+    /// v0.5.1 延遲補償：correct 帶 measuredAt = frameTime（facts.timestamp，
+    /// 帧 PTS 秒）。Vision 管線 100–200ms 延遲下，舊版 correct 以 0.35 權重把
+    /// 「現在」的融合值往「舊帧的位置」拖 — 移動中舊帧位置恆在用戶移動方向
+    /// 的後方，回拖速率與陀螺儀前進速率同量級 ⇒ 標記視覺上被手拖著走
+    /// （本輪共症 (c) 真凶）。Core 以回溯環形緩衝取 frameTime 當下的融合值
+    /// 算 innovation — 量測只修正「當時」的誤差，不再吃掉之後的合法前進
+    /// 位移。時基一致性論證與 1.0s 防禦 guard 見
+    /// AimFusionCoordinator.correct(_:measuredAt:)。
+    /// 換靶帧的 reset 已清空回溯緩衝 → 緊接的 correct 在 Core 內自然退化
+    /// 相容版 = 首筆 pass-through，跳切語意不變。
+    private func updateAimFusion(
+        guidance: TargetGuidance, rawAnchor: NPoint?, isFront: Bool, frameTime: Double
+    ) {
         aimFusion.setIsFront(isFront)
         guard let target = guidance.target else {
             lastAimTarget = nil
@@ -530,8 +604,46 @@ final class CoachSession {
             lastAimTarget = target
         }
         if let rawAnchor {
-            aimFusion.correct(AimPointSolver.marker(anchor: rawAnchor, target: target))
+            aimFusion.correct(
+                AimPointSolver.marker(anchor: rawAnchor, target: target),
+                measuredAt: frameTime
+            )
         }
+    }
+
+    // MARK: - 對準增益持久化（v0.5.1）
+
+    /// UserDefaults key（前後鏡各一組 — FOV 換算殘差與符號成因兩鏡位不同，
+    /// 學得增益不可共用；key 名為契約值，勿改）。
+    private static func aimGainKeys(isFront: Bool) -> (x: String, y: String) {
+        isFront
+            ? ("aim.gain.x.front", "aim.gain.y.front")
+            : ("aim.gain.x.back", "aim.gain.y.back")
+    }
+
+    /// 融合器目前學得的逐軸增益落盤。呼叫時機（契約）：setActive(false) 與
+    /// 翻鏡 reset「前」。isFront 必須傳「增益所屬」鏡位（aimGainsIsFront），
+    /// 不可傳 camera.isFront — 翻鏡回呼觸發時後者已是新鏡位。
+    private func saveAimGains(isFront: Bool) {
+        let keys = Self.aimGainKeys(isFront: isFront)
+        let gains = aimFusion.gains()
+        UserDefaults.standard.set(gains.x, forKey: keys.x)
+        UserDefaults.standard.set(gains.y, forKey: keys.y)
+    }
+
+    /// 恢復指定鏡位的持久化增益並記下鏡位。無值 → 1.0（未校準 = 原始行為）。
+    /// 必用 object(forKey:) as? Double：double(forKey:) 無值回 0.0 —
+    /// seed 0 等於把該軸陀螺儀整個關掉。壞值（非有限）同樣退 1.0；
+    /// 範圍由 Core 增益不變式把關（恆 clamp [−2.5, 2.5]）。
+    private func seedAimGains(isFront: Bool) {
+        let keys = Self.aimGainKeys(isFront: isFront)
+        let defaults = UserDefaults.standard
+        let x = (defaults.object(forKey: keys.x) as? Double)
+            .flatMap { $0.isFinite ? $0 : nil } ?? 1.0
+        let y = (defaults.object(forKey: keys.y) as? Double)
+            .flatMap { $0.isFinite ? $0 : nil } ?? 1.0
+        aimFusion.seedGains(x: x, y: y)
+        aimGainsIsFront = isFront
     }
 
     // MARK: - 熱降級（F30）
@@ -843,7 +955,8 @@ private final class CoachPipeline {
 
 /// GyroFusedPoint（Core，純數學、無鎖）的執行緒安全協調器：
 /// - aimMotionQueue（~100Hz）：ingest() 角速度 → normalized 位移 → predict
-/// - MainActor（~15fps publish）：correct() / reset()；（~60Hz timer）讀 value
+/// - MainActor（~15fps publish）：correct(_:measuredAt:) / reset() /
+///   gains() / seedGains()；（~60Hz timer）讀 value
 /// - analysisQueue（tracker 距離）：distanceFromCrosshair()
 /// 全部經同一把 NSLock（臨界區皆為常數時間純算術，100Hz 無競爭壓力）。
 /// Core 檔不動 — A1 契約：融合器只做座標空間內純數學，FOV／裝置軸／
@@ -925,7 +1038,11 @@ private final class AimFusionCoordinator: @unchecked Sendable {
     /// - 繞光軸的 roll（rotationRate.z）刻意忽略：離心標記會微幅弧移，
     ///   量級小且同樣被 correct 拉回（有意簡化，非遺漏）。
     ///
-    /// ⚠ 全部符號「待真機驗證」：實測若某軸反向，翻對應 sx / sy 一行即修。
+    /// ⚠ 符號推導自 v0.5.1 起降級為「初值先驗」：GyroFusedPoint AutoGain
+    /// 逐軸線上學增益 — 某軸實機反向 ⇒ 該軸增益自動收斂到負值翻號（自癒）；
+    /// FOV／變焦換算殘差 ⇒ 收斂到 ≠1 補償。sx/sy 保留讓先驗盡量正確
+    /// （收斂只需吃殘差，不必從 +1 慢慢走到 −1）；實測確認某軸恆反時
+    /// 仍應翻此處一行 — 先驗對，新裝置／清資料後的首次收斂最快。
     func ingest(rotationRateX: Double, rotationRateY: Double, timestamp: TimeInterval) {
         lock.lock()
         defer { lock.unlock() }
@@ -942,19 +1059,72 @@ private final class AimFusionCoordinator: @unchecked Sendable {
         let sy: Double = isFront ? -1 : 1   // 前鏡：光軸反向翻 y（推導見上）
         let dx = sx * (rotationRateY * dt) / hFOVRad
         let dy = sy * (rotationRateX * dt) / vFOVRad
-        // 融合器 value 為 nil（尚無首筆 Vision 量測）時 predict 靜默忽略 —
+        // 融合器 value 為 nil（尚無首筆 Vision 量測）時 predict 不動 value —
         // 沒有基準點無從累加（GyroFusedPoint 契約），此處不必再判。
-        fused.predict(dxNormalized: dx, dyNormalized: dy)
+        // v0.5.1：dx/dy 傳「原始」位移（未乘增益）— 逐軸增益由 Core 套用並
+        // 線上學習（AutoGain）；timestamp 同時是回溯環形緩衝的時間軸，
+        // 與 correct 的 frameTime 同一「開機起算 mach 時基」（見 correct 注釋）。
+        fused.predict(dxNormalized: dx, dyNormalized: dy, at: timestamp)
     }
 
     // MARK: Vision 修正／讀值
 
-    func correct(_ marker: NPoint) {
+    /// 延遲補償修正步（v0.5.1）：frameTime = FrameFacts.timestamp（帧 PTS 秒）。
+    ///
+    /// 時基一致性查證（契約要求，依據寫明）：
+    /// - frameTime 來源 = VideoFrameTap 的 CMSampleBufferGetPresentationTimeStamp
+    ///   (sampleBuffer).seconds。AVCaptureSession 輸出 buffer 的 PTS 掛在
+    ///   session synchronizationClock，iOS 內建鏡頭預設 = host time clock
+    ///   （mach_absolute_time 換算秒、開機起算）；VideoFrameTap 對非有限 PTS
+    ///   的 fallback 亦為 ProcessInfo.systemUptime（同基準）。
+    /// - CMDeviceMotion.timestamp 官方文件明訂 = 裝置開機起算秒數，
+    ///   與 systemUptime 同一 mach 時基。
+    /// ⇒ 兩者同為「開機起算 mach 時基秒」，理論同源、可直接互減 —
+    /// 以 frameTime 查 motion 時間軸的回溯緩衝落在同一座標上。
+    /// 風險（防禦理由）：Apple 未承諾 capture session 永遠掛 host clock
+    /// （外接鏡頭／未來 OS 可能用 device clock）；一旦不同源，差值恆常偏移，
+    /// 回溯會查到錯誤時點 — 比不補償更糟。
+    /// 防禦（一行 guard；有它永不劣於沒有）：|frameTime − 最近 motion 時間|
+    /// > 1.0s ⇒ 視為時基不合 ⇒ 退化相容版 correct（= v0.5.0 即時修正行為）。
+    /// 尚無 motion 樣本（模擬器無 gyro／motion 未啟動）同走相容版 —
+    /// 緩衝為空，回溯本無意義（Core 端同會退化，此處明判更直白）。
+    func correct(_ marker: NPoint, measuredAt frameTime: Double) {
         lock.lock()
         defer { lock.unlock() }
-        fused.correct(marker)
+        if let motionTime = lastMotionTimestamp, abs(frameTime - motionTime) <= 1.0 {
+            fused.correct(marker, measuredAt: frameTime)
+        } else {
+            fused.correct(marker)
+        }
     }
 
+    // MARK: 增益（v0.5.1 AutoGain 持久化；MainActor 呼叫）
+
+    /// 目前學得的逐軸增益（未學 = 1.0；符號反的軸收斂為負值）。落盤用。
+    func gains() -> (x: Double, y: Double) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (fused.gainX, fused.gainY)
+    }
+
+    /// 持久化恢復（Core 契約：只設增益，不動 value／回溯緩衝）。
+    func seedGains(x: Double, y: Double) {
+        lock.lock()
+        defer { lock.unlock() }
+        fused.seedGains(x: x, y: y)
+    }
+
+    /// 只清 AutoGain 量測基準（不動 value／緩衝／增益）：量測 anchor 定義
+    /// 跳變但 target 未變時用（群組臉數跨 2 邊緣 — union 中心跳變不得進
+    /// 增益學習；跳過一筆學習、標記連續性不受影響）。MainActor 呼叫。
+    func invalidateGainBaseline() {
+        lock.lock()
+        defer { lock.unlock() }
+        fused.invalidateGainBaseline()
+    }
+
+    /// 清 value／回溯緩衝／AutoGain 量測基準；「不清」增益（Core 契約 —
+    /// 增益是鏡位屬性，跨換靶／跨會期沿用；換鏡位由呼叫端 save/seed）。
     func reset() {
         lock.lock()
         defer { lock.unlock() }
